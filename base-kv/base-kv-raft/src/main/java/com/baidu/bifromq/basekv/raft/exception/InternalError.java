@@ -14,6 +14,10 @@
 package com.baidu.bifromq.basekv.raft.exception;
 
 public class InternalError extends Error {
+    public InternalError(String message) {
+        super(message);
+    }
+
     public InternalError(Throwable e) {
         super(e);
     }

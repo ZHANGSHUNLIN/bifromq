@@ -55,8 +55,8 @@ import static com.bifromq.plugin.resourcethrottler.TenantResourceType.TotalRetai
 import static com.bifromq.plugin.resourcethrottler.TenantResourceType.TotalSharedSubscriptions;
 import static java.util.concurrent.CompletableFuture.allOf;
 
+import com.baidu.bifromq.base.util.FutureTracker;
 import com.baidu.bifromq.basehlc.HLC;
-import com.baidu.bifromq.baserpc.utils.FutureTracker;
 import com.baidu.bifromq.dist.client.PubResult;
 import com.baidu.bifromq.inbox.storage.proto.LWT;
 import com.baidu.bifromq.inbox.storage.proto.TopicFilterOption;
@@ -109,6 +109,7 @@ import com.baidu.bifromq.retain.rpc.proto.MatchReply;
 import com.baidu.bifromq.retain.rpc.proto.RetainReply;
 import com.baidu.bifromq.sessiondict.client.ISessionRegistration;
 import com.baidu.bifromq.sessiondict.rpc.proto.ServerRedirection;
+import com.baidu.bifromq.sysprops.props.ClientRedirectCheckIntervalSeconds;
 import com.baidu.bifromq.sysprops.props.SanityCheckMqttUtf8String;
 import com.baidu.bifromq.type.ClientInfo;
 import com.baidu.bifromq.type.MQTTClientInfoConstants;
@@ -158,6 +159,7 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 public abstract class MQTTSessionHandler extends MQTTMessageHandler implements IMQTTSession {
     protected static final boolean SANITY_CHECK = SanityCheckMqttUtf8String.INSTANCE.get();
+    private static final int REDIRECT_CHECK_INTERVAL_SECONDS = ClientRedirectCheckIntervalSeconds.INSTANCE.get();
     protected final TenantSettings settings;
     protected final String userSessionId;
     protected final int keepAliveTimeSeconds;
@@ -179,7 +181,7 @@ public abstract class MQTTSessionHandler extends MQTTMessageHandler implements I
     private final LinkedHashMap<Integer, ConfirmingMessage> unconfirmedPacketIds = new LinkedHashMap<>();
     private final TreeSet<ConfirmingMessage> resendQueue;
     private final CompletableFuture<Void> onInitialized = new CompletableFuture<>();
-    private LWT willMessage;
+    private LWT noDelayLWT;
     private boolean isGoAway;
     private ScheduledFuture<?> idleTimeoutTask;
     private ScheduledFuture<?> redirectTask;
@@ -194,7 +196,7 @@ public abstract class MQTTSessionHandler extends MQTTMessageHandler implements I
                                  String userSessionId,
                                  int keepAliveTimeSeconds,
                                  ClientInfo clientInfo,
-                                 @Nullable LWT willMessage,
+                                 @Nullable LWT noDelayLWT,
                                  ChannelHandlerContext ctx) {
         this.sizer = clientInfo.getMetadataOrDefault(MQTT_PROTOCOL_VER_KEY, "").equals(MQTT_PROTOCOL_VER_5_VALUE)
             ? IMQTTMessageSizer.mqtt5() : IMQTTMessageSizer.mqtt3();
@@ -204,7 +206,7 @@ public abstract class MQTTSessionHandler extends MQTTMessageHandler implements I
         this.userSessionId = userSessionId;
         this.keepAliveTimeSeconds = keepAliveTimeSeconds;
         this.clientInfo = clientInfo;
-        this.willMessage = willMessage;
+        this.noDelayLWT = noDelayLWT;
         this.tenantMeter = tenantMeter;
         this.throttler = new MPSThrottler(settings.maxMsgPerSec);
         this.idleTimeoutNanos = Duration.ofMillis(keepAliveTimeSeconds * 1500L).toNanos(); // x1.5
@@ -221,8 +223,8 @@ public abstract class MQTTSessionHandler extends MQTTMessageHandler implements I
         int s = 144; // base size from JOL
         s += userSessionId.length();
         s += clientInfo.getSerializedSize();
-        if (willMessage != null) {
-            s += willMessage.getSerializedSize();
+        if (noDelayLWT != null) {
+            s += noDelayLWT.getSerializedSize();
         }
         return s;
     }
@@ -332,7 +334,7 @@ public abstract class MQTTSessionHandler extends MQTTMessageHandler implements I
     }
 
     protected final LWT willMessage() {
-        return willMessage;
+        return noDelayLWT;
     }
 
     protected final <T> CompletableFuture<T> addFgTask(CompletableFuture<T> taskFuture) {
@@ -393,8 +395,8 @@ public abstract class MQTTSessionHandler extends MQTTMessageHandler implements I
         if (resendTask != null) {
             resendTask.cancel(true);
         }
-        if (willMessage != null) {
-            addBgTask(pubWillMessage(willMessage));
+        if (noDelayLWT != null) {
+            addBgTask(pubWillMessage(noDelayLWT));
         }
         Sets.newHashSet(fgTasks).forEach(t -> t.cancel(true));
         sessionCtx.localSessionRegistry.remove(channelId(), this);
@@ -1421,22 +1423,23 @@ public abstract class MQTTSessionHandler extends MQTTMessageHandler implements I
     }
 
     private void scheduleRedirectCheck() {
-        long delay = ThreadLocalRandom.current().nextInt(60000);
-        redirectTask = ctx.executor().schedule(this::checkRedirect, delay, TimeUnit.MILLISECONDS);
+        long delay = ThreadLocalRandom.current().nextInt(REDIRECT_CHECK_INTERVAL_SECONDS);
+        redirectTask = ctx.executor()
+            .scheduleAtFixedRate(this::checkRedirect, delay, REDIRECT_CHECK_INTERVAL_SECONDS, TimeUnit.SECONDS);
     }
 
     private void checkRedirect() {
         Optional<Redirection> redirection = sessionCtx.clientBalancer.needRedirect(clientInfo);
-        if (redirection.isPresent()) {
-            handleProtocolResponse(helper().onRedirect(redirection.get().permanentMove(),
-                redirection.get().serverReference().orElse(null)));
-        } else {
-            scheduleRedirectCheck();
-        }
+        redirection.ifPresent(value -> {
+            if (redirectTask != null) {
+                redirectTask.cancel(true);
+            }
+            handleProtocolResponse(helper().onRedirect(value.permanentMove(), value.serverReference().orElse(null)));
+        });
     }
 
     protected final void discardLWT() {
-        willMessage = null;
+        noDelayLWT = null;
     }
 
     protected final void resumeChannelRead() {

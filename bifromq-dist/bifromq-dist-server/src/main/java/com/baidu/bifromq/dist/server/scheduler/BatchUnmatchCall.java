@@ -13,7 +13,7 @@
 
 package com.baidu.bifromq.dist.server.scheduler;
 
-import com.baidu.bifromq.basekv.client.IBaseKVStoreClient;
+import com.baidu.bifromq.basekv.client.IMutationPipeline;
 import com.baidu.bifromq.basekv.client.exception.BadVersionException;
 import com.baidu.bifromq.basekv.client.exception.TryLaterException;
 import com.baidu.bifromq.basekv.client.scheduler.BatchMutationCall;
@@ -39,8 +39,8 @@ import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 class BatchUnmatchCall extends BatchMutationCall<UnmatchRequest, UnmatchReply> {
-    BatchUnmatchCall(IBaseKVStoreClient distWorkerClient, MutationCallBatcherKey batcherKey) {
-        super(distWorkerClient, batcherKey);
+    BatchUnmatchCall(IMutationPipeline pipeline, MutationCallBatcherKey batcherKey) {
+        super(pipeline, batcherKey);
     }
 
     @Override
@@ -74,21 +74,21 @@ class BatchUnmatchCall extends BatchMutationCall<UnmatchRequest, UnmatchReply> {
     @Override
     protected void handleException(ICallTask<UnmatchRequest, UnmatchReply, MutationCallBatcherKey> callTask,
                                    Throwable e) {
-        if (e instanceof ServerNotFoundException || e.getCause() instanceof ServerNotFoundException) {
+        if (e instanceof ServerNotFoundException) {
             callTask.resultPromise().complete(UnmatchReply.newBuilder()
                 .setReqId(callTask.call().getReqId())
                 .setResult(UnmatchReply.Result.TRY_LATER)
                 .build());
             return;
         }
-        if (e instanceof BadVersionException || e.getCause() instanceof BadVersionException) {
+        if (e instanceof BadVersionException) {
             callTask.resultPromise().complete(UnmatchReply.newBuilder()
                 .setReqId(callTask.call().getReqId())
                 .setResult(UnmatchReply.Result.TRY_LATER)
                 .build());
             return;
         }
-        if (e instanceof TryLaterException || e.getCause() instanceof TryLaterException) {
+        if (e instanceof TryLaterException) {
             callTask.resultPromise().complete(UnmatchReply.newBuilder()
                 .setReqId(callTask.call().getReqId())
                 .setResult(UnmatchReply.Result.TRY_LATER)

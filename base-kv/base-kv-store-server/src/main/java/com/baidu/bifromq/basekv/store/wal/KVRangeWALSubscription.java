@@ -13,9 +13,9 @@
 
 package com.baidu.bifromq.basekv.store.wal;
 
+import com.baidu.bifromq.base.util.AsyncRunner;
 import com.baidu.bifromq.basekv.proto.KVRangeSnapshot;
 import com.baidu.bifromq.basekv.raft.proto.LogEntry;
-import com.baidu.bifromq.basekv.store.util.AsyncRunner;
 import com.baidu.bifromq.basekv.utils.KVRangeIdUtil;
 import com.baidu.bifromq.logger.SiftLogger;
 import io.reactivex.rxjava3.core.Observable;
@@ -66,12 +66,11 @@ class KVRangeWALSubscription implements IKVRangeWALSubscription {
                 applyRunner.add(restore(task))
                     .handle((snap, e) -> fetchRunner.add(() -> {
                         if (e != null) {
+                            log.error(
+                                "Failed to install snapshot\n{}", snap);
                             return;
                         }
-                        log.debug(
-                            "Snapshot installed: range={}, ver={}, state={}, checkpoint={}, lastAppliedIndex={}",
-                            KVRangeIdUtil.toString(snap.getId()),
-                            snap.getVer(), snap.getState(), snap.getCheckpointId(), snap.getLastAppliedIndex());
+                        log.debug("Snapshot installed\n{}", snap);
                         lastFetchedIdx.set(snap.getLastAppliedIndex());
                         commitIdx.set(-1);
                     }));

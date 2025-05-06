@@ -33,8 +33,8 @@ import static com.bifromq.plugin.resourcethrottler.TenantResourceType.TotalPersi
 import static com.bifromq.plugin.resourcethrottler.TenantResourceType.TotalPersistentSubscriptions;
 import static com.bifromq.plugin.resourcethrottler.TenantResourceType.TotalPersistentUnsubscribePerSecond;
 
+import com.baidu.bifromq.base.util.AsyncRetry;
 import com.baidu.bifromq.basehlc.HLC;
-import com.baidu.bifromq.basescheduler.AsyncRetry;
 import com.baidu.bifromq.inbox.client.IInboxClient;
 import com.baidu.bifromq.inbox.rpc.proto.CommitRequest;
 import com.baidu.bifromq.inbox.rpc.proto.DetachReply;
@@ -54,7 +54,7 @@ import com.baidu.bifromq.plugin.eventcollector.OutOfTenantResource;
 import com.baidu.bifromq.plugin.eventcollector.mqttbroker.clientdisconnect.ByClient;
 import com.baidu.bifromq.retain.rpc.proto.MatchReply;
 import com.baidu.bifromq.retain.rpc.proto.MatchRequest;
-import com.baidu.bifromq.sysprops.props.DataPlaneBurstLatencyMillis;
+import com.baidu.bifromq.sysprops.props.DataPlaneMaxBurstLatencyMillis;
 import com.baidu.bifromq.type.ClientInfo;
 import com.baidu.bifromq.type.MatchInfo;
 import com.baidu.bifromq.type.Message;
@@ -86,10 +86,10 @@ public abstract class MQTTPersistentSessionHandler extends MQTTSessionHandler im
     private final NavigableMap<Long, SubMessage> stagingBuffer = new TreeMap<>();
     private final IInboxClient inboxClient;
     private final Cache<String, AtomicReference<Long>> qoS0TimestampsByMQTTPublisher = Caffeine.newBuilder()
-        .expireAfterAccess(2 * DataPlaneBurstLatencyMillis.INSTANCE.get(), TimeUnit.MILLISECONDS)
+        .expireAfterAccess(2 * DataPlaneMaxBurstLatencyMillis.INSTANCE.get(), TimeUnit.MILLISECONDS)
         .build();
     private final Cache<String, AtomicReference<Long>> qoS12TimestampsByMQTTPublisher = Caffeine.newBuilder()
-        .expireAfterAccess(2 * DataPlaneBurstLatencyMillis.INSTANCE.get(), TimeUnit.MILLISECONDS)
+        .expireAfterAccess(2 * DataPlaneMaxBurstLatencyMillis.INSTANCE.get(), TimeUnit.MILLISECONDS)
         .build();
     private boolean qos0Confirming = false;
     private boolean inboxConfirming = false;
@@ -107,9 +107,9 @@ public abstract class MQTTPersistentSessionHandler extends MQTTSessionHandler im
                                            int sessionExpirySeconds,
                                            ClientInfo clientInfo,
                                            InboxVersion inboxVersion,
-                                           @Nullable LWT willMessage,
+                                           @Nullable LWT noDelayLWT,
                                            ChannelHandlerContext ctx) {
-        super(settings, tenantMeter, oomCondition, userSessionId, keepAliveTimeSeconds, clientInfo, willMessage, ctx);
+        super(settings, tenantMeter, oomCondition, userSessionId, keepAliveTimeSeconds, clientInfo, noDelayLWT, ctx);
         this.inboxVersion = inboxVersion;
         this.inboxClient = sessionCtx.inboxClient;
         this.sessionExpirySeconds = sessionExpirySeconds;
@@ -213,11 +213,11 @@ public abstract class MQTTPersistentSessionHandler extends MQTTSessionHandler im
         state = State.DETACH;
         addBgTask(AsyncRetry.exec(() -> inboxClient.detach(request),
             (reply, t) -> {
-                if (t != null) {
-                    return true;
+                if (reply != null) {
+                    return reply.getCode() == DetachReply.Code.TRY_LATER;
                 }
-                return reply.getCode() != DetachReply.Code.TRY_LATER;
-            }, 1000, 5000));
+                return false;
+            }, sessionCtx.retryTimeoutNanos / 5, sessionCtx.retryTimeoutNanos));
     }
 
     @Override
@@ -244,6 +244,7 @@ public abstract class MQTTPersistentSessionHandler extends MQTTSessionHandler im
                 .setInboxId(userSessionId)
                 .setVersion(inboxVersion)
                 .setTopicFilter(topicFilter)
+                .setMaxTopicFilters(settings.maxTopicFiltersPerInbox)
                 .setOption(option)
                 .setNow(HLC.INST.getPhysical())
                 .build())

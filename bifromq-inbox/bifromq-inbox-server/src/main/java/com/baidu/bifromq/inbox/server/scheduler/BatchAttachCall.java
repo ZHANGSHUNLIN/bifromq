@@ -14,7 +14,7 @@
 package com.baidu.bifromq.inbox.server.scheduler;
 
 import com.baidu.bifromq.basehlc.HLC;
-import com.baidu.bifromq.basekv.client.IBaseKVStoreClient;
+import com.baidu.bifromq.basekv.client.IMutationPipeline;
 import com.baidu.bifromq.basekv.client.exception.BadVersionException;
 import com.baidu.bifromq.basekv.client.exception.TryLaterException;
 import com.baidu.bifromq.basekv.client.scheduler.BatchMutationCall;
@@ -39,8 +39,8 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 class BatchAttachCall extends BatchMutationCall<AttachRequest, AttachReply> {
 
-    protected BatchAttachCall(IBaseKVStoreClient distWorkerClient, MutationCallBatcherKey batcherKey) {
-        super(distWorkerClient, batcherKey);
+    protected BatchAttachCall(IMutationPipeline pipeline, MutationCallBatcherKey batcherKey) {
+        super(pipeline, batcherKey);
     }
 
     @Override
@@ -101,21 +101,21 @@ class BatchAttachCall extends BatchMutationCall<AttachRequest, AttachReply> {
     @Override
     protected void handleException(ICallTask<AttachRequest, AttachReply, MutationCallBatcherKey> callTask,
                                    Throwable e) {
-        if (e instanceof ServerNotFoundException || e.getCause() instanceof ServerNotFoundException) {
+        if (e instanceof ServerNotFoundException) {
             callTask.resultPromise().complete(AttachReply.newBuilder()
                 .setReqId(callTask.call().getReqId())
                 .setCode(AttachReply.Code.TRY_LATER)
                 .build());
             return;
         }
-        if (e instanceof BadVersionException || e.getCause() instanceof BadVersionException) {
+        if (e instanceof BadVersionException) {
             callTask.resultPromise().complete(AttachReply.newBuilder()
                 .setReqId(callTask.call().getReqId())
                 .setCode(AttachReply.Code.TRY_LATER)
                 .build());
             return;
         }
-        if (e instanceof TryLaterException || e.getCause() instanceof TryLaterException) {
+        if (e instanceof TryLaterException) {
             callTask.resultPromise().complete(AttachReply.newBuilder()
                 .setReqId(callTask.call().getReqId())
                 .setCode(AttachReply.Code.TRY_LATER)

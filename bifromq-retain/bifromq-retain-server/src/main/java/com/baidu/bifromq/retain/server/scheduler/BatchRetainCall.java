@@ -13,7 +13,7 @@
 
 package com.baidu.bifromq.retain.server.scheduler;
 
-import com.baidu.bifromq.basekv.client.IBaseKVStoreClient;
+import com.baidu.bifromq.basekv.client.IMutationPipeline;
 import com.baidu.bifromq.basekv.client.exception.BadVersionException;
 import com.baidu.bifromq.basekv.client.exception.TryLaterException;
 import com.baidu.bifromq.basekv.client.scheduler.BatchMutationCall;
@@ -35,8 +35,8 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 public class BatchRetainCall extends BatchMutationCall<RetainRequest, RetainReply> {
 
-    protected BatchRetainCall(IBaseKVStoreClient retainStoreClient, MutationCallBatcherKey batcherKey) {
-        super(retainStoreClient, batcherKey);
+    protected BatchRetainCall(IMutationPipeline pipeline, MutationCallBatcherKey batcherKey) {
+        super(pipeline, batcherKey);
     }
 
     @Override
@@ -82,21 +82,21 @@ public class BatchRetainCall extends BatchMutationCall<RetainRequest, RetainRepl
     @Override
     protected void handleException(ICallTask<RetainRequest, RetainReply, MutationCallBatcherKey> callTask,
                                    Throwable e) {
-        if (e instanceof ServerNotFoundException || e.getCause() instanceof ServerNotFoundException) {
+        if (e instanceof ServerNotFoundException) {
             callTask.resultPromise().complete(RetainReply.newBuilder()
                 .setReqId(callTask.call().getReqId())
                 .setResult(RetainReply.Result.TRY_LATER)
                 .build());
             return;
         }
-        if (e instanceof BadVersionException || e.getCause() instanceof BadVersionException) {
+        if (e instanceof BadVersionException) {
             callTask.resultPromise().complete(RetainReply.newBuilder()
                 .setReqId(callTask.call().getReqId())
                 .setResult(RetainReply.Result.TRY_LATER)
                 .build());
             return;
         }
-        if (e instanceof TryLaterException || e.getCause() instanceof TryLaterException) {
+        if (e instanceof TryLaterException) {
             callTask.resultPromise().complete(RetainReply.newBuilder()
                 .setReqId(callTask.call().getReqId())
                 .setResult(RetainReply.Result.TRY_LATER)

@@ -13,6 +13,7 @@
 
 package com.baidu.bifromq.dist.server.scheduler;
 
+import static com.baidu.bifromq.base.util.CompletableFutureUtil.unwrap;
 import static com.baidu.bifromq.basekv.client.KVRangeRouterUtil.findByBoundary;
 import static com.baidu.bifromq.basekv.utils.BoundaryUtil.toBoundary;
 import static com.baidu.bifromq.basekv.utils.BoundaryUtil.upperBound;
@@ -61,11 +62,11 @@ import java.util.concurrent.CompletableFuture;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
-class BatchDistServerCall implements IBatchCall<DistServerCall, DistServerCallResult, DistServerCallBatcherKey> {
+class BatchDistServerCall implements IBatchCall<TenantPubRequest, DistServerCallResult, DistServerCallBatcherKey> {
     private final IBaseKVStoreClient distWorkerClient;
     private final DistServerCallBatcherKey batcherKey;
     private final String orderKey;
-    private final Queue<ICallTask<DistServerCall, DistServerCallResult, DistServerCallBatcherKey>> tasks =
+    private final Queue<ICallTask<TenantPubRequest, DistServerCallResult, DistServerCallBatcherKey>> tasks =
         new ArrayDeque<>();
     private Map<String, Map<ClientInfo, Iterable<Message>>> batch = new HashMap<>(128);
 
@@ -76,7 +77,7 @@ class BatchDistServerCall implements IBatchCall<DistServerCall, DistServerCallRe
     }
 
     @Override
-    public void add(ICallTask<DistServerCall, DistServerCallResult, DistServerCallBatcherKey> callTask) {
+    public void add(ICallTask<TenantPubRequest, DistServerCallResult, DistServerCallBatcherKey> callTask) {
         tasks.add(callTask);
         callTask.call().publisherMessagePacks().forEach(publisherMsgPack -> publisherMsgPack.getMessagePackList()
             .forEach(topicMsgs -> batch.computeIfAbsent(topicMsgs.getTopic(), k -> new HashMap<>())
@@ -100,7 +101,7 @@ class BatchDistServerCall implements IBatchCall<DistServerCall, DistServerCallRe
         Collection<KVRangeSetting> candidates = rangeLookup();
         if (candidates.isEmpty()) {
             // no candidate range
-            ICallTask<DistServerCall, DistServerCallResult, DistServerCallBatcherKey> task;
+            ICallTask<TenantPubRequest, DistServerCallResult, DistServerCallBatcherKey> task;
             while ((task = tasks.poll()) != null) {
                 Map<String, Integer> fanOutResult = new HashMap<>();
                 task.call().publisherMessagePacks().forEach(clientMessagePack -> clientMessagePack.getMessagePackList()
@@ -133,19 +134,23 @@ class BatchDistServerCall implements IBatchCall<DistServerCall, DistServerCallRe
                 batchDistBuilder.addDistPack(distPackBuilder.build());
             });
             return distWorkerClient.query(rangeReplica.storeId,
-                KVRangeRORequest.newBuilder().setReqId(reqId).setVer(rangeReplica.ver).setKvRangeId(rangeReplica.id)
-                    .setRoCoProc(ROCoProcInput.newBuilder().setDistService(
-                        DistServiceROCoProcInput.newBuilder().setBatchDist(batchDistBuilder.build()).build()).build())
-                    .build(), orderKey).exceptionally(e -> {
-                if (e instanceof ServerNotFoundException || e.getCause() instanceof ServerNotFoundException) {
-                    // map server not found to try later
-                    return KVRangeROReply.newBuilder().setReqId(reqId).setCode(ReplyCode.TryLater).build();
-                } else {
-                    log.debug("Failed to query range: {}", rangeReplica, e);
-                    // map rpc exception to internal error
-                    return KVRangeROReply.newBuilder().setReqId(reqId).setCode(ReplyCode.InternalError).build();
-                }
-            });
+                    KVRangeRORequest.newBuilder().setReqId(reqId).setVer(rangeReplica.ver).setKvRangeId(rangeReplica.id)
+                        .setRoCoProc(ROCoProcInput.newBuilder()
+                            .setDistService(DistServiceROCoProcInput.newBuilder()
+                                .setBatchDist(batchDistBuilder.build())
+                                .build())
+                            .build())
+                        .build(), orderKey)
+                .exceptionally(unwrap(e -> {
+                    if (e instanceof ServerNotFoundException) {
+                        // map server not found to try later
+                        return KVRangeROReply.newBuilder().setReqId(reqId).setCode(ReplyCode.TryLater).build();
+                    } else {
+                        log.debug("Failed to query range: {}", rangeReplica, e);
+                        // map rpc exception to internal error
+                        return KVRangeROReply.newBuilder().setReqId(reqId).setCode(ReplyCode.InternalError).build();
+                    }
+                }));
         }).toArray(CompletableFuture[]::new);
         return CompletableFuture.allOf(rangeQueryReplies).thenAccept(replies -> {
             boolean needRetry = false;
@@ -173,7 +178,7 @@ class BatchDistServerCall implements IBatchCall<DistServerCall, DistServerCallRe
                     default -> hasError = true;
                 }
             }
-            ICallTask<DistServerCall, DistServerCallResult, DistServerCallBatcherKey> task;
+            ICallTask<TenantPubRequest, DistServerCallResult, DistServerCallBatcherKey> task;
             if (needRetry && !hasError) {
                 while ((task = tasks.poll()) != null) {
                     task.resultPromise()

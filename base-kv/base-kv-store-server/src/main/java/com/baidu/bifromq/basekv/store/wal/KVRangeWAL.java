@@ -129,11 +129,6 @@ public class KVRangeWAL implements IKVRangeWAL, IRaftNode.ISnapshotInstaller {
     }
 
     @Override
-    public ClusterConfig clusterConfig() {
-        return raftNode.latestClusterConfig();
-    }
-
-    @Override
     public Observable<Map<String, RaftNodeSyncState>> replicationStatus() {
         return syncStatePublisher.distinctUntilChanged();
     }
@@ -185,11 +180,6 @@ public class KVRangeWAL implements IKVRangeWAL, IRaftNode.ISnapshotInstaller {
     }
 
     @Override
-    public Observable<SnapshotRestoredEvent> snapshotRestoreEvent() {
-        return snapRestoreEventPublisher;
-    }
-
-    @Override
     public CompletableFuture<Iterator<LogEntry>> retrieveCommitted(long fromIndex, long maxSize) {
         return raftNode.retrieveCommitted(fromIndex, maxSize);
     }
@@ -218,6 +208,11 @@ public class KVRangeWAL implements IKVRangeWAL, IRaftNode.ISnapshotInstaller {
     @Override
     public KVRangeSnapshot latestSnapshot() {
         return ZeroCopyParser.parse(raftNode.latestSnapshot(), KVRangeSnapshot.parser());
+    }
+
+    @Override
+    public ClusterConfig latestClusterConfig() {
+        return raftNode.latestClusterConfig();
     }
 
     @Override

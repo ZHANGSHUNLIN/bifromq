@@ -13,7 +13,7 @@
 
 package com.baidu.bifromq.inbox.server.scheduler;
 
-import com.baidu.bifromq.basekv.client.IBaseKVStoreClient;
+import com.baidu.bifromq.basekv.client.IQueryPipeline;
 import com.baidu.bifromq.basekv.client.exception.BadVersionException;
 import com.baidu.bifromq.basekv.client.exception.TryLaterException;
 import com.baidu.bifromq.basekv.client.scheduler.BatchQueryCall;
@@ -33,8 +33,8 @@ import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 class BatchSendLWTCall extends BatchQueryCall<SendLWTRequest, SendLWTReply> {
-    protected BatchSendLWTCall(IBaseKVStoreClient storeClient, QueryCallBatcherKey batcherKey) {
-        super(storeClient, true, batcherKey);
+    protected BatchSendLWTCall(IQueryPipeline pipeline, QueryCallBatcherKey batcherKey) {
+        super(pipeline, batcherKey);
     }
 
     @Override
@@ -93,21 +93,21 @@ class BatchSendLWTCall extends BatchQueryCall<SendLWTRequest, SendLWTReply> {
     @Override
     protected void handleException(ICallTask<SendLWTRequest, SendLWTReply, QueryCallBatcherKey> callTask,
                                    Throwable e) {
-        if (e instanceof ServerNotFoundException || e.getCause() instanceof ServerNotFoundException) {
+        if (e instanceof ServerNotFoundException) {
             callTask.resultPromise().complete(SendLWTReply.newBuilder()
                 .setReqId(callTask.call().getReqId())
                 .setCode(SendLWTReply.Code.TRY_LATER)
                 .build());
             return;
         }
-        if (e instanceof BadVersionException || e.getCause() instanceof BadVersionException) {
+        if (e instanceof BadVersionException) {
             callTask.resultPromise().complete(SendLWTReply.newBuilder()
                 .setReqId(callTask.call().getReqId())
                 .setCode(SendLWTReply.Code.TRY_LATER)
                 .build());
             return;
         }
-        if (e instanceof TryLaterException || e.getCause() instanceof TryLaterException) {
+        if (e instanceof TryLaterException) {
             callTask.resultPromise().complete(SendLWTReply.newBuilder()
                 .setReqId(callTask.call().getReqId())
                 .setCode(SendLWTReply.Code.TRY_LATER)

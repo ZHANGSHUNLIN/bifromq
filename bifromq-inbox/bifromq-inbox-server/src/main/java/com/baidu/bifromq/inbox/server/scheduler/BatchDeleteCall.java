@@ -15,7 +15,7 @@ package com.baidu.bifromq.inbox.server.scheduler;
 
 import static java.util.Collections.emptySet;
 
-import com.baidu.bifromq.basekv.client.IBaseKVStoreClient;
+import com.baidu.bifromq.basekv.client.IMutationPipeline;
 import com.baidu.bifromq.basekv.client.exception.BadVersionException;
 import com.baidu.bifromq.basekv.client.exception.TryLaterException;
 import com.baidu.bifromq.basekv.client.scheduler.BatchMutationCall;
@@ -40,8 +40,8 @@ import lombok.extern.slf4j.Slf4j;
 @Slf4j
 class BatchDeleteCall extends BatchMutationCall<DeleteRequest, DeleteReply> {
 
-    protected BatchDeleteCall(IBaseKVStoreClient distWorkerClient, MutationCallBatcherKey batcherKey) {
-        super(distWorkerClient, batcherKey);
+    protected BatchDeleteCall(IMutationPipeline pipeline, MutationCallBatcherKey batcherKey) {
+        super(pipeline, batcherKey);
     }
 
     @Override
@@ -104,21 +104,21 @@ class BatchDeleteCall extends BatchMutationCall<DeleteRequest, DeleteReply> {
     @Override
     protected void handleException(ICallTask<DeleteRequest, DeleteReply, MutationCallBatcherKey> callTask,
                                    Throwable e) {
-        if (e instanceof ServerNotFoundException || e.getCause() instanceof ServerNotFoundException) {
+        if (e instanceof ServerNotFoundException) {
             callTask.resultPromise().complete(DeleteReply.newBuilder()
                 .setReqId(callTask.call().getReqId())
                 .setCode(DeleteReply.Code.TRY_LATER)
                 .build());
             return;
         }
-        if (e instanceof BadVersionException || e.getCause() instanceof BadVersionException) {
+        if (e instanceof BadVersionException) {
             callTask.resultPromise().complete(DeleteReply.newBuilder()
                 .setReqId(callTask.call().getReqId())
                 .setCode(DeleteReply.Code.TRY_LATER)
                 .build());
             return;
         }
-        if (e instanceof TryLaterException || e.getCause() instanceof TryLaterException) {
+        if (e instanceof TryLaterException) {
             callTask.resultPromise().complete(DeleteReply.newBuilder()
                 .setReqId(callTask.call().getReqId())
                 .setCode(DeleteReply.Code.TRY_LATER)

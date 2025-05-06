@@ -13,13 +13,12 @@
 
 package com.baidu.bifromq.basekv.raft;
 
-import static com.baidu.bifromq.basekv.raft.exception.DropProposalException.superseded;
-
 import com.baidu.bifromq.basekv.raft.exception.ClusterConfigChangeException;
 import com.baidu.bifromq.basekv.raft.exception.DropProposalException;
 import com.baidu.bifromq.basekv.raft.exception.LeaderTransferException;
 import com.baidu.bifromq.basekv.raft.exception.ReadIndexException;
 import com.baidu.bifromq.basekv.raft.exception.RecoveryException;
+import com.baidu.bifromq.basekv.raft.exception.SnapshotException;
 import com.baidu.bifromq.basekv.raft.proto.AppendEntries;
 import com.baidu.bifromq.basekv.raft.proto.AppendEntriesReply;
 import com.baidu.bifromq.basekv.raft.proto.InstallSnapshot;
@@ -46,12 +45,6 @@ import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 
 class RaftNodeStateFollower extends RaftNodeState {
-    private static class StabilizingTask {
-        int pendingReplyCount = 0;
-        long readIndex = -1;
-        boolean committed = false;
-    }
-
     private final TreeMap<Long, StabilizingTask> stabilizingIndexes = new TreeMap<>(Long::compareTo);
     private final LinkedHashMap<Long, Set<Integer>> tickToReadRequestsMap;
     private final Map<Integer, CompletableFuture<Long>> idToReadRequestMap;
@@ -132,9 +125,8 @@ class RaftNodeStateFollower extends RaftNodeState {
     }
 
     @Override
-    RaftNodeState recover(CompletableFuture<Void> onDone) {
+    void recover(CompletableFuture<Void> onDone) {
         onDone.completeExceptionally(RecoveryException.notLostQuorum());
-        return this;
     }
 
     @Override
@@ -179,7 +171,8 @@ class RaftNodeStateFollower extends RaftNodeState {
         }
         if (electionElapsedTick >= randomElectionTimeoutTick) {
             electionElapsedTick = 0;
-            abortPendingRequests();
+            abortPendingReadIndexRequests(ReadIndexException.forwardTimeout());
+            abortPendingProposeRequests(DropProposalException.forwardTimeout());
             // transit to candidate only if no snapshot installation is in progress
             if (currentISSRequest == null) {
                 log.debug("Transit to candidate due to election timeout[{}]", randomElectionTimeoutTick);
@@ -209,7 +202,7 @@ class RaftNodeStateFollower extends RaftNodeState {
         }
         if (currentLeader == null) {
             log.debug("Dropped proposal due to no leader elected in current term");
-            onDone.completeExceptionally(DropProposalException.NoLeader());
+            onDone.completeExceptionally(DropProposalException.noLeader());
             return;
         }
         if (isProposeThrottled()) {
@@ -362,7 +355,10 @@ class RaftNodeStateFollower extends RaftNodeState {
                 break;
             case TIMEOUTNOW:
                 nextState = handleTimeoutNow(fromPeer);
-            default:
+                break;
+            default: {
+                // ignore other messages
+            }
         }
         return nextState;
     }
@@ -384,12 +380,20 @@ class RaftNodeStateFollower extends RaftNodeState {
     @Override
     void onSnapshotRestored(ByteString requested, ByteString installed, Throwable ex, CompletableFuture<Void> onDone) {
         if (currentISSRequest == null) {
+            log.debug("Snapshot installation request not found");
+            onDone.completeExceptionally(new SnapshotException("No snapshot installation request"));
             return;
         }
         InstallSnapshot iss = currentISSRequest;
         Snapshot snapshot = iss.getSnapshot();
         if (snapshot.getData() != requested) {
-            log.debug("Skip reply for obsolete snapshot installation");
+            if (ex != null) {
+                log.debug("Obsolete snapshot install failed", ex);
+                onDone.completeExceptionally(ex);
+            } else {
+                log.debug("Obsolete snapshot installation");
+                onDone.completeExceptionally(new SnapshotException("Obsolete snapshot installed by FSM"));
+            }
             return;
         }
         currentISSRequest = null;
@@ -409,7 +413,7 @@ class RaftNodeStateFollower extends RaftNodeState {
             submitRaftMessages(iss.getLeaderId(), reply);
             onDone.completeExceptionally(ex);
         } else {
-            log.debug("Snapshot[index:{},term:{}] accepted by FSM", snapshot.getIndex(), snapshot.getTerm());
+            log.info("Snapshot[index:{},term:{}] accepted by FSM", snapshot.getIndex(), snapshot.getTerm());
             try {
                 // replace fsm snapshot data with the installed one
                 snapshot = snapshot.toBuilder().setData(installed).build();
@@ -427,14 +431,6 @@ class RaftNodeStateFollower extends RaftNodeState {
                             .build())
                     .build();
                 notifySnapshotRestored();
-                abortPendingRequests();
-                // Abort all uncommitted proposals inherited from previous leader state, since they may be superseded by snapshot
-                for (Iterator<Map.Entry<Long, ProposeTask>> it = uncommittedProposals.entrySet().iterator();
-                     it.hasNext(); ) {
-                    Map.Entry<Long, ProposeTask> entry = it.next();
-                    entry.getValue().future.completeExceptionally(superseded());
-                    it.remove();
-                }
                 submitRaftMessages(iss.getLeaderId(), reply);
                 onDone.complete(null);
             } catch (Throwable e) {
@@ -453,6 +449,13 @@ class RaftNodeStateFollower extends RaftNodeState {
                 onDone.completeExceptionally(e);
             }
         }
+    }
+
+    @Override
+    public void stop() {
+        super.stop();
+        abortPendingReadIndexRequests(ReadIndexException.cancelled());
+        abortPendingProposeRequests(DropProposalException.cancelled());
     }
 
     private void handleAppendEntries(String fromLeader, AppendEntries appendEntries) {
@@ -519,15 +522,16 @@ class RaftNodeStateFollower extends RaftNodeState {
                 if (stabilizingIndexes.isEmpty()) {
                     // all entries have been stabilized
                     if (newCommitIndex <= stateStorage.lastIndex()) {
+                        log.trace("Advanced commitIndex[from:{},to:{}]", commitIndex, newCommitIndex);
                         commitIndex = newCommitIndex;
-                        log.trace("Advanced commitIndex[{}]", commitIndex);
                         // report to application
                         notifyCommit();
                     } else {
                         // entries between lastIndex and newCommitIndex missing, probably because the channel between
                         // leader and follower is lossy.
                         // In this case add it to stabilizingIndexes
-                        log.debug("Entries[from:{},to:{}] missing locally", stateStorage.lastIndex(), newCommitIndex);
+                        log.debug("Committed entries[from:{},to:{}] missing locally",
+                            stateStorage.lastIndex(), newCommitIndex);
                         stabilizingIndexes.compute(stateStorage.lastIndex(), (k, v) -> {
                             if (v == null) {
                                 v = new StabilizingTask();
@@ -540,15 +544,16 @@ class RaftNodeStateFollower extends RaftNodeState {
                 }
                 if (newCommitIndex < stabilizingIndexes.firstKey()) {
                     // if the new commitIndex has been stabilized locally, then advance local commitIndex directly
+                    log.trace("Entries before index[{}] have stabilized, Advanced commitIndex[from:{},to:{}]",
+                        stabilizingIndexes.firstKey(), commitIndex, newCommitIndex);
                     commitIndex = newCommitIndex;
-                    log.trace("Advanced commitIndex[{}]", commitIndex);
                     // report to application
                     notifyCommit();
                 } else {
                     if (newCommitIndex > stabilizingIndexes.lastKey()) {
                         // if the newCommitIndex is greater than the largest local stabilizing index
                         // add it to stabilizingIndexes and mark it has been committed
-                        log.debug("Entries[from:{},to:{}] missing locally",
+                        log.debug("Committed Entries[from:{},to:{}] missing locally",
                             stabilizingIndexes.lastKey(), newCommitIndex);
                     }
                     stabilizingIndexes.compute(stateStorage.lastIndex(), (k, v) -> {
@@ -633,6 +638,18 @@ class RaftNodeStateFollower extends RaftNodeState {
                     DropProposalException.transferringLeader());
                 case DropByMaxUnappliedEntries -> pendingOnDone.completeExceptionally(
                     DropProposalException.throttledByThreshold());
+                case DropByNoLeader -> pendingOnDone.completeExceptionally(DropProposalException.noLeader());
+                case DropByForwardTimeout ->
+                    pendingOnDone.completeExceptionally(DropProposalException.forwardTimeout());
+                case DropByOverridden -> pendingOnDone.completeExceptionally(DropProposalException.overridden());
+                case DropBySupersededBySnapshot ->
+                    pendingOnDone.completeExceptionally(DropProposalException.superseded());
+                case DropByLeaderForwardDisabled ->
+                    pendingOnDone.completeExceptionally(DropProposalException.leaderForwardDisabled());
+                default -> {
+                    assert reply.getCode() == ProposeReply.Code.DropByCancel;
+                    pendingOnDone.completeExceptionally(DropProposalException.cancelled());
+                }
             }
         }
     }
@@ -640,7 +657,8 @@ class RaftNodeStateFollower extends RaftNodeState {
     private RaftNodeState handleTimeoutNow(String fromLeader) {
         if (promotable()) {
             log.info("Transited to candidate now by request from current leader[{}]", fromLeader);
-            abortPendingRequests();
+            abortPendingReadIndexRequests(ReadIndexException.cancelled());
+            abortPendingProposeRequests(DropProposalException.cancelled());
             return new RaftNodeStateCandidate(
                 currentTerm(),
                 commitIndex,
@@ -675,7 +693,7 @@ class RaftNodeStateFollower extends RaftNodeState {
             && (vote.isEmpty() || vote.get().getTerm() < currentTerm()));
     }
 
-    private void abortPendingRequests() {
+    private void abortPendingReadIndexRequests(ReadIndexException e) {
         for (Iterator<Map.Entry<Long, Set<Integer>>> it = tickToReadRequestsMap.entrySet().iterator();
              it.hasNext(); ) {
             Map.Entry<Long, Set<Integer>> entry = it.next();
@@ -684,10 +702,13 @@ class RaftNodeStateFollower extends RaftNodeState {
                 CompletableFuture<Long> pendingOnDone = idToReadRequestMap.remove(pendingReadId);
                 if (pendingOnDone != null && !pendingOnDone.isDone()) {
                     // if not finished by requestReadIndexReply then abort it
-                    pendingOnDone.completeExceptionally(ReadIndexException.forwardTimeout());
+                    pendingOnDone.completeExceptionally(e);
                 }
             });
         }
+    }
+
+    private void abortPendingProposeRequests(DropProposalException e) {
         for (Iterator<Map.Entry<Long, Set<Integer>>> it = tickToForwardedProposesMap.entrySet().iterator();
              it.hasNext(); ) {
             Map.Entry<Long, Set<Integer>> entry = it.next();
@@ -696,7 +717,7 @@ class RaftNodeStateFollower extends RaftNodeState {
                 CompletableFuture<Long> pendingOnDone = idToForwardedProposeMap.remove(pendingProposalId);
                 if (pendingOnDone != null && !pendingOnDone.isDone()) {
                     // if not finished by requestReadIndexReply then abort it
-                    pendingOnDone.completeExceptionally(DropProposalException.forwardTimeout());
+                    pendingOnDone.completeExceptionally(e);
                 }
             });
         }
@@ -710,5 +731,11 @@ class RaftNodeStateFollower extends RaftNodeState {
             Snapshot snapshot = stateStorage.latestSnapshot();
             return snapshot.getIndex() == index && snapshot.getTerm() == term;
         }
+    }
+
+    private static class StabilizingTask {
+        int pendingReplyCount = 0;
+        long readIndex = -1;
+        boolean committed = false;
     }
 }

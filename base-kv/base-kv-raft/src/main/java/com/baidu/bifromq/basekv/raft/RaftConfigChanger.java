@@ -30,7 +30,7 @@ import java.util.concurrent.CompletableFuture;
 import org.slf4j.Logger;
 
 /**
- * The cluster config change process goes through following phases:
+ * The cluster config change process goes through following phases.
  * <pre>
  *  1. [catching up] new added voters and learners act as non-voting members, and catching up with leader by
  *     receiving replicated log entries from leader. cluster change is not appended to log in this phase, so it's
@@ -60,14 +60,10 @@ import org.slf4j.Logger;
  *  </pre>
  */
 class RaftConfigChanger {
-    enum State {
-        Abort, // the terminated state
-        Waiting, // changer could accept submission of new config change
-        CatchingUp, // catching up new voters in new submitted config
-        JointConfigCommitting, // joint config is appended as log entry and waiting to be committed
-        TargetConfigCommitting // target config is appended as log entry and waiting to be committed
-    }
-
+    private final RaftConfig config;
+    private final IRaftStateStore stateStorage;
+    private final PeerLogTracker peerLogTracker;
+    private final Logger logger;
     private volatile State state = Waiting;
     private volatile CompletableFuture<Void> onDone;
     private long catchingUpElapsedTick = 0;
@@ -75,10 +71,6 @@ class RaftConfigChanger {
     private long targetConfigIndex = 0;
     private ClusterConfig jointConfig;
     private ClusterConfig targetConfig;
-    private final RaftConfig config;
-    private final IRaftStateStore stateStorage;
-    private final PeerLogTracker peerLogTracker;
-    private final Logger logger;
 
     RaftConfigChanger(RaftConfig config,
                       IRaftStateStore stateStorage,
@@ -111,10 +103,17 @@ class RaftConfigChanger {
             }
             this.onDone = onDone;
 
-            jointConfig = stateStorage.latestClusterConfig().toBuilder()
+            ClusterConfig latestConfig = stateStorage.latestClusterConfig();
+            Set<String> allVoters = new HashSet<>(latestConfig.getNextVotersList());
+            allVoters.addAll(nextVoters);
+            Set<String> allLearners = new HashSet<>(latestConfig.getNextLearnersList());
+            allLearners.addAll(nextLearners);
+            jointConfig = ClusterConfig.newBuilder()
                 .setCorrelateId(correlateId)
-                .addAllNextVoters(nextVoters)
-                .addAllNextLearners(nextLearners)
+                .addAllVoters(latestConfig.getVotersList())
+                .addAllLearners(latestConfig.getLearnersList())
+                .addAllNextVoters(allVoters)
+                .addAllNextLearners(allLearners)
                 .build();
             targetConfig = ClusterConfig.newBuilder()
                 .setCorrelateId(correlateId)
@@ -136,7 +135,7 @@ class RaftConfigChanger {
     }
 
     /**
-     * It's leader's responsibility to call this method on each tick
+     * It's leader's responsibility to call this method on each tick.
      *
      * @param currentTerm leader's current term
      * @return if there is a state change
@@ -147,8 +146,8 @@ class RaftConfigChanger {
             catchingUpElapsedTick++;
             // enough time for installing snapshot plus 10 times electionTimeout for digesting log entries
             // accumulated
-            if (catchingUpElapsedTick >=
-                config.getInstallSnapshotTimeoutTick() + 10L * config.getElectionTimeoutTick()) {
+            if (catchingUpElapsedTick
+                >= config.getInstallSnapshotTimeoutTick() + 10L * config.getElectionTimeoutTick()) {
                 logger.debug("Catching up timeout, give up changing config");
 
                 // report exception, unregister replicators and transit to Waiting state
@@ -249,7 +248,7 @@ class RaftConfigChanger {
     }
 
     /**
-     * This method must be called when caller finishes handling TargetConfig committing
+     * This method must be called when caller finishes handling TargetConfig committing.
      */
     public void confirmCommit(boolean notifyRepStatus) {
         assert state == Waiting && targetConfig != null;
@@ -276,6 +275,9 @@ class RaftConfigChanger {
                 all.addAll(jointConfig.getNextLearnersList());
                 all.remove(stateStorage.local());
             }
+            default -> {
+                // do nothing
+            }
         }
         return all;
     }
@@ -285,16 +287,19 @@ class RaftConfigChanger {
     }
 
     /**
-     * Once aborted, the instance could not be reused anymore
+     * Once aborted, the instance could not be reused anymore.
      */
-    public void abort() {
+    public void abort(ClusterConfigChangeException e) {
         assert state != Abort;
         switch (state) {
             case Waiting -> state = Abort;
             case CatchingUp, TargetConfigCommitting, JointConfigCommitting -> {
                 logger.debug("Abort on-going cluster config change");
                 state = Abort;
-                onDone.completeExceptionally(ClusterConfigChangeException.leaderStepDown());
+                onDone.completeExceptionally(e);
+            }
+            default -> {
+                // do nothing
             }
         }
     }
@@ -338,9 +343,9 @@ class RaftConfigChanger {
 
     boolean noChangeJoint(ClusterConfig clusterConfig) {
         return (new HashSet<>(clusterConfig.getNextVotersList()))
-            .equals(new HashSet<>(clusterConfig.getVotersList())) &&
-            (new HashSet<>(clusterConfig.getNextLearnersList())
-                .equals(new HashSet<>(clusterConfig.getLearnersList())));
+            .equals(new HashSet<>(clusterConfig.getVotersList()))
+            && (new HashSet<>(clusterConfig.getNextLearnersList())
+            .equals(new HashSet<>(clusterConfig.getLearnersList())));
     }
 
     <T> boolean isIntersect(Set<T> s1, Set<T> s2) {
@@ -352,5 +357,13 @@ class RaftConfigChanger {
             }
         }
         return false;
+    }
+
+    enum State {
+        Abort, // the terminated state
+        Waiting, // changer could accept submission of new config change
+        CatchingUp, // catching up new voters in new submitted config
+        JointConfigCommitting, // joint config is appended as log entry and waiting to be committed
+        TargetConfigCommitting // target config is appended as log entry and waiting to be committed
     }
 }

@@ -84,7 +84,7 @@ class RaftNodeStateCandidate extends RaftNodeState {
     }
 
     @Override
-    RaftNodeState recover(CompletableFuture<Void> onDone) {
+    void recover(CompletableFuture<Void> onDone) {
         if (!promotable()) {
             onDone.completeExceptionally(RecoveryException.notVoter());
         } else if (recoveryTask == null) {
@@ -93,7 +93,6 @@ class RaftNodeStateCandidate extends RaftNodeState {
         } else {
             onDone.completeExceptionally(RecoveryException.recoveryInProgress());
         }
-        return this;
     }
 
     @Override
@@ -112,7 +111,7 @@ class RaftNodeStateCandidate extends RaftNodeState {
 
     @Override
     void propose(ByteString fsmCmd, CompletableFuture<Long> onDone) {
-        onDone.completeExceptionally(DropProposalException.NoLeader());
+        onDone.completeExceptionally(DropProposalException.noLeader());
     }
 
     @Override
@@ -147,6 +146,9 @@ class RaftNodeStateCandidate extends RaftNodeState {
                             finishRecoveryTask(RecoveryException.notLostQuorum());
                             log.debug("Pre-Election lost[{}] and stay as candidate", preVoteResult);
                         }
+                        default -> {
+                            // do nothing
+                        }
                     }
                 } // don't fall through
                 // fallthrough to become follower at new term if pre-vote is not granted
@@ -177,8 +179,8 @@ class RaftNodeStateCandidate extends RaftNodeState {
             // term match, leader of this term has been elected
             switch (message.getMessageTypeCase()) {
                 case APPENDENTRIES, INSTALLSNAPSHOT -> {
-                    String leader = message.getMessageTypeCase() == RaftMessage.MessageTypeCase.APPENDENTRIES ?
-                        message.getAppendEntries().getLeaderId() : message.getInstallSnapshot().getLeaderId();
+                    String leader = message.getMessageTypeCase() == RaftMessage.MessageTypeCase.APPENDENTRIES
+                        ? message.getAppendEntries().getLeaderId() : message.getInstallSnapshot().getLeaderId();
                     log.debug("Transited to follower to handle request from newly elected leader[{}]", leader);
                     finishRecoveryTask(RecoveryException.notLostQuorum());
                     nextState = new RaftNodeStateFollower(
@@ -206,6 +208,9 @@ class RaftNodeStateCandidate extends RaftNodeState {
                     log.debug("Rejected vote for candidate[{}]", fromPeer);
                     sendRequestVoteReply(fromPeer, currentTerm(), false);
                 }
+                default -> {
+                    // do nothing
+                }
             }
         }
         return nextState;
@@ -227,6 +232,12 @@ class RaftNodeStateCandidate extends RaftNodeState {
     @Override
     void onSnapshotRestored(ByteString requested, ByteString installed, Throwable ex, CompletableFuture<Void> onDone) {
         onDone.complete(null);
+    }
+
+    @Override
+    public void stop() {
+        super.stop();
+        finishRecoveryTask(RecoveryException.cancelled());
     }
 
     RaftNodeState campaign(boolean preVote, boolean transferLeader) {

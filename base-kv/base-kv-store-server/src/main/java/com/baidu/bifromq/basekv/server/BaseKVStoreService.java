@@ -13,6 +13,7 @@
 
 package com.baidu.bifromq.basekv.server;
 
+import static com.baidu.bifromq.base.util.CompletableFutureUtil.unwrap;
 import static com.baidu.bifromq.basekv.utils.BoundaryUtil.FULL_BOUNDARY;
 import static com.baidu.bifromq.baserpc.server.UnaryResponse.response;
 
@@ -149,10 +150,17 @@ class BaseKVStoreService extends BaseKVStoreServiceGrpc.BaseKVStoreServiceImplBa
                 .setReqId(request.getReqId())
                 .setCode(ReplyCode.Ok)
                 .build())
-            .exceptionally(e -> TransferLeadershipReply.newBuilder()
-                .setReqId(request.getReqId())
-                .setCode(convertKVRangeException(e))
-                .build()), responseObserver);
+            .exceptionally(unwrap(e -> {
+                TransferLeadershipReply.Builder replyBuilder = TransferLeadershipReply.newBuilder()
+                    .setReqId(request.getReqId())
+                    .setCode(convertKVRangeException(e));
+                if (e instanceof KVRangeException.BadVersion badVersion) {
+                    if (badVersion.latest != null) {
+                        replyBuilder.setLatest(badVersion.latest);
+                    }
+                }
+                return replyBuilder.build();
+            })), responseObserver);
     }
 
     @Override
@@ -165,24 +173,37 @@ class BaseKVStoreService extends BaseKVStoreServiceGrpc.BaseKVStoreServiceImplBa
                 .setReqId(request.getReqId())
                 .setCode(ReplyCode.Ok)
                 .build())
-            .exceptionally(e -> ChangeReplicaConfigReply.newBuilder()
-                .setReqId(request.getReqId())
-                .setCode(convertKVRangeException(e))
-                .build()), responseObserver);
+            .exceptionally(unwrap(e -> {
+                ChangeReplicaConfigReply.Builder replyBuilder = ChangeReplicaConfigReply.newBuilder()
+                    .setReqId(request.getReqId())
+                    .setCode(convertKVRangeException(e));
+                if (e instanceof KVRangeException.BadVersion badVersion) {
+                    if (badVersion.latest != null) {
+                        replyBuilder.setLatest(badVersion.latest);
+                    }
+                }
+                return replyBuilder.build();
+            })), responseObserver);
     }
 
     @Override
     public void split(KVRangeSplitRequest request, StreamObserver<KVRangeSplitReply> responseObserver) {
         response(tenantId -> kvRangeStore.split(request.getVer(), request.getKvRangeId(), request.getSplitKey())
-                .thenApply(result -> KVRangeSplitReply.newBuilder()
+            .thenApply(result -> KVRangeSplitReply.newBuilder()
+                .setReqId(request.getReqId())
+                .setCode(ReplyCode.Ok)
+                .build())
+            .exceptionally(unwrap(e -> {
+                KVRangeSplitReply.Builder replyBuilder = KVRangeSplitReply.newBuilder()
                     .setReqId(request.getReqId())
-                    .setCode(ReplyCode.Ok)
-                    .build())
-                .exceptionally(e -> KVRangeSplitReply.newBuilder()
-                    .setReqId(request.getReqId())
-                    .setCode(convertKVRangeException(e))
-                    .build()),
-            responseObserver);
+                    .setCode(convertKVRangeException(e));
+                if (e instanceof KVRangeException.BadVersion badVersion) {
+                    if (badVersion.latest != null) {
+                        replyBuilder.setLatest(badVersion.latest);
+                    }
+                }
+                return replyBuilder.build();
+            })), responseObserver);
     }
 
     @Override
@@ -192,10 +213,17 @@ class BaseKVStoreService extends BaseKVStoreServiceGrpc.BaseKVStoreServiceImplBa
                 .setReqId(request.getReqId())
                 .setCode(ReplyCode.Ok)
                 .build())
-            .exceptionally(e -> KVRangeMergeReply.newBuilder()
-                .setReqId(request.getReqId())
-                .setCode(convertKVRangeException(e))
-                .build()), responseObserver);
+            .exceptionally(unwrap(e -> {
+                KVRangeMergeReply.Builder replyBuilder = KVRangeMergeReply.newBuilder()
+                    .setReqId(request.getReqId())
+                    .setCode(convertKVRangeException(e));
+                if (e instanceof KVRangeException.BadVersion badVersion) {
+                    if (badVersion.latest != null) {
+                        replyBuilder.setLatest(badVersion.latest);
+                    }
+                }
+                return replyBuilder.build();
+            })), responseObserver);
     }
 
     @Override
@@ -214,13 +242,13 @@ class BaseKVStoreService extends BaseKVStoreServiceGrpc.BaseKVStoreServiceImplBa
     }
 
     private ReplyCode convertKVRangeException(Throwable e) {
-        if (e instanceof KVRangeException.BadVersion || e.getCause() instanceof KVRangeException.BadVersion) {
+        if (e instanceof KVRangeException.BadVersion) {
             return ReplyCode.BadVersion;
         }
-        if (e instanceof KVRangeException.TryLater || e.getCause() instanceof KVRangeException.TryLater) {
+        if (e instanceof KVRangeException.TryLater) {
             return ReplyCode.TryLater;
         }
-        if (e instanceof KVRangeException.BadRequest || e.getCause() instanceof KVRangeException.BadRequest) {
+        if (e instanceof KVRangeException.BadRequest) {
             return ReplyCode.BadRequest;
         }
         log.error("Internal Error", e);

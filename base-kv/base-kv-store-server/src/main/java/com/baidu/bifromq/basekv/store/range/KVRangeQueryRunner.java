@@ -16,8 +16,10 @@ package com.baidu.bifromq.basekv.store.range;
 import static com.baidu.bifromq.basekv.proto.State.StateType.Merged;
 import static com.baidu.bifromq.basekv.proto.State.StateType.Removed;
 import static com.baidu.bifromq.basekv.proto.State.StateType.ToBePurged;
+import static com.baidu.bifromq.basekv.store.util.VerUtil.boundaryCompatible;
 import static java.util.concurrent.CompletableFuture.completedFuture;
 
+import com.baidu.bifromq.basekv.proto.KVRangeDescriptor;
 import com.baidu.bifromq.basekv.proto.State;
 import com.baidu.bifromq.basekv.store.api.IKVLoadRecord;
 import com.baidu.bifromq.basekv.store.api.IKVRangeCoProc;
@@ -36,6 +38,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.StampedLock;
+import java.util.function.Supplier;
 import org.slf4j.Logger;
 
 class KVRangeQueryRunner implements IKVRangeQueryRunner {
@@ -48,12 +51,14 @@ class KVRangeQueryRunner implements IKVRangeQueryRunner {
     private final StampedLock queryLock;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final List<IKVRangeSplitHinter> splitHinters;
+    private final Supplier<KVRangeDescriptor> latestStatusSupplier;
 
     KVRangeQueryRunner(IKVRange kvRange,
                        IKVRangeCoProc coProc,
                        Executor executor,
                        IKVRangeQueryLinearizer linearizer,
                        List<IKVRangeSplitHinter> splitHinters,
+                       Supplier<KVRangeDescriptor> latestStatusSupplier,
                        StampedLock queryLock,
                        String... tags) {
         this.kvRange = kvRange;
@@ -62,6 +67,7 @@ class KVRangeQueryRunner implements IKVRangeQueryRunner {
         this.linearizer = linearizer;
         this.queryLock = queryLock;
         this.splitHinters = splitHinters;
+        this.latestStatusSupplier = latestStatusSupplier;
         this.log = SiftLogger.getLogger(KVRangeQueryRunner.class, tags);
     }
 
@@ -104,6 +110,10 @@ class KVRangeQueryRunner implements IKVRangeQueryRunner {
     private <ReqT, ResultT> CompletableFuture<ResultT> submit(long ver,
                                                               QueryFunction<ReqT, ResultT> queryFn,
                                                               boolean linearized) {
+        if (!boundaryCompatible(ver, kvRange.version())) {
+            return CompletableFuture.failedFuture(
+                new KVRangeException.BadVersion("Version Mismatch", latestStatusSupplier.get()));
+        }
         CompletableFuture<ResultT> onDone = new CompletableFuture<>();
         runningQueries.add(onDone);
         Runnable queryTask = () -> {
@@ -139,8 +149,7 @@ class KVRangeQueryRunner implements IKVRangeQueryRunner {
         return onDone;
     }
 
-    private <ReqT, ResultT> CompletableFuture<ResultT> doQuery(long ver,
-                                                               QueryFunction<ReqT, ResultT> queryFn) {
+    private <ReqT, ResultT> CompletableFuture<ResultT> doQuery(long ver, QueryFunction<ReqT, ResultT> queryFn) {
         CompletableFuture<ResultT> onDone = new CompletableFuture<>();
         long stamp = queryLock.readLock();
         try {
@@ -148,11 +157,10 @@ class KVRangeQueryRunner implements IKVRangeQueryRunner {
             // return the borrowed reader when future completed
             onDone.whenComplete((v, e) -> kvRange.returnDataReader(dataReader));
             State state = kvRange.state();
-            if (ver != kvRange.version()) {
+            if (!boundaryCompatible(ver, kvRange.version())) {
                 queryLock.unlockRead(stamp);
                 onDone.completeExceptionally(
-                    new KVRangeException.BadVersion(
-                        "Version Mismatch: expect=" + kvRange.version() + ", actual=" + ver));
+                    new KVRangeException.BadVersion("Version Mismatch", latestStatusSupplier.get()));
                 return onDone;
             }
             if (state.getType() == Merged || state.getType() == Removed || state.getType() == ToBePurged) {

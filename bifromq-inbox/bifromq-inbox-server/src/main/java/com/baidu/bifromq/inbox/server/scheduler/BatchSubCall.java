@@ -15,7 +15,7 @@ package com.baidu.bifromq.inbox.server.scheduler;
 
 import static java.util.Collections.emptySet;
 
-import com.baidu.bifromq.basekv.client.IBaseKVStoreClient;
+import com.baidu.bifromq.basekv.client.IMutationPipeline;
 import com.baidu.bifromq.basekv.client.exception.BadVersionException;
 import com.baidu.bifromq.basekv.client.exception.TryLaterException;
 import com.baidu.bifromq.basekv.client.scheduler.BatchMutationCall;
@@ -39,8 +39,8 @@ import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
 class BatchSubCall extends BatchMutationCall<SubRequest, SubReply> {
-    protected BatchSubCall(IBaseKVStoreClient distWorkerClient, MutationCallBatcherKey batcherKey) {
-        super(distWorkerClient, batcherKey);
+    protected BatchSubCall(IMutationPipeline pipeline, MutationCallBatcherKey batcherKey) {
+        super(pipeline, batcherKey);
     }
 
     @Override
@@ -58,6 +58,7 @@ class BatchSubCall extends BatchMutationCall<SubRequest, SubReply> {
                 .setInboxId(request.getInboxId())
                 .setVersion(request.getVersion())
                 .setTopicFilter(request.getTopicFilter())
+                .setMaxTopicFilters(request.getMaxTopicFilters())
                 .setOption(request.getOption())
                 .setNow(request.getNow());
             reqBuilder.addParams(paramsBuilder.build());
@@ -97,21 +98,21 @@ class BatchSubCall extends BatchMutationCall<SubRequest, SubReply> {
 
     @Override
     protected void handleException(ICallTask<SubRequest, SubReply, MutationCallBatcherKey> callTask, Throwable e) {
-        if (e instanceof ServerNotFoundException || e.getCause() instanceof ServerNotFoundException) {
+        if (e instanceof ServerNotFoundException) {
             callTask.resultPromise().complete(SubReply.newBuilder()
                 .setReqId(callTask.call().getReqId())
                 .setCode(SubReply.Code.TRY_LATER)
                 .build());
             return;
         }
-        if (e instanceof BadVersionException || e.getCause() instanceof BadVersionException) {
+        if (e instanceof BadVersionException) {
             callTask.resultPromise().complete(SubReply.newBuilder()
                 .setReqId(callTask.call().getReqId())
                 .setCode(SubReply.Code.TRY_LATER)
                 .build());
             return;
         }
-        if (e instanceof TryLaterException || e.getCause() instanceof TryLaterException) {
+        if (e instanceof TryLaterException) {
             callTask.resultPromise().complete(SubReply.newBuilder()
                 .setReqId(callTask.call().getReqId())
                 .setCode(SubReply.Code.TRY_LATER)

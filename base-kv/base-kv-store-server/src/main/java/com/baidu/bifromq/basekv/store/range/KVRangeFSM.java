@@ -13,9 +13,11 @@
 
 package com.baidu.bifromq.basekv.store.range;
 
+import static com.baidu.bifromq.base.util.CompletableFutureUtil.unwrap;
 import static com.baidu.bifromq.basekv.proto.State.StateType.ConfigChanging;
 import static com.baidu.bifromq.basekv.proto.State.StateType.Merged;
 import static com.baidu.bifromq.basekv.proto.State.StateType.MergedQuiting;
+import static com.baidu.bifromq.basekv.proto.State.StateType.NoUse;
 import static com.baidu.bifromq.basekv.proto.State.StateType.Normal;
 import static com.baidu.bifromq.basekv.proto.State.StateType.PreparedMerging;
 import static com.baidu.bifromq.basekv.proto.State.StateType.Removed;
@@ -27,6 +29,8 @@ import static com.baidu.bifromq.basekv.store.range.KVRangeFSM.Lifecycle.Destroyi
 import static com.baidu.bifromq.basekv.store.range.KVRangeFSM.Lifecycle.Init;
 import static com.baidu.bifromq.basekv.store.range.KVRangeFSM.Lifecycle.Open;
 import static com.baidu.bifromq.basekv.store.util.ExecutorServiceUtil.awaitShutdown;
+import static com.baidu.bifromq.basekv.store.util.VerUtil.boundaryCompatible;
+import static com.baidu.bifromq.basekv.store.util.VerUtil.print;
 import static com.baidu.bifromq.basekv.utils.BoundaryUtil.NULL_BOUNDARY;
 import static com.baidu.bifromq.basekv.utils.BoundaryUtil.canCombine;
 import static com.baidu.bifromq.basekv.utils.BoundaryUtil.combine;
@@ -36,7 +40,9 @@ import static com.google.common.collect.Sets.newHashSet;
 import static com.google.common.collect.Sets.union;
 import static java.util.Collections.emptySet;
 import static java.util.Collections.singleton;
+import static java.util.Collections.singletonList;
 
+import com.baidu.bifromq.base.util.AsyncRunner;
 import com.baidu.bifromq.baseenv.EnvProvider;
 import com.baidu.bifromq.baseenv.ZeroCopyParser;
 import com.baidu.bifromq.basehlc.HLC;
@@ -68,9 +74,9 @@ import com.baidu.bifromq.basekv.proto.SnapshotSyncRequest;
 import com.baidu.bifromq.basekv.proto.SplitHint;
 import com.baidu.bifromq.basekv.proto.SplitRange;
 import com.baidu.bifromq.basekv.proto.State;
-import com.baidu.bifromq.basekv.proto.TransferLeadership;
 import com.baidu.bifromq.basekv.proto.WALRaftMessages;
 import com.baidu.bifromq.basekv.raft.exception.LeaderTransferException;
+import com.baidu.bifromq.basekv.raft.exception.SnapshotException;
 import com.baidu.bifromq.basekv.raft.proto.ClusterConfig;
 import com.baidu.bifromq.basekv.raft.proto.LogEntry;
 import com.baidu.bifromq.basekv.raft.proto.RaftMessage;
@@ -88,7 +94,6 @@ import com.baidu.bifromq.basekv.store.proto.ROCoProcOutput;
 import com.baidu.bifromq.basekv.store.proto.RWCoProcInput;
 import com.baidu.bifromq.basekv.store.proto.RWCoProcOutput;
 import com.baidu.bifromq.basekv.store.stats.IStatsCollector;
-import com.baidu.bifromq.basekv.store.util.AsyncRunner;
 import com.baidu.bifromq.basekv.store.util.VerUtil;
 import com.baidu.bifromq.basekv.store.wal.IKVRangeWAL;
 import com.baidu.bifromq.basekv.store.wal.IKVRangeWALStore;
@@ -123,7 +128,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedTransferQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.StampedLock;
 import java.util.function.Supplier;
@@ -152,16 +159,18 @@ public class KVRangeFSM implements IKVRangeFSM {
     private final Map<String, CompletableFuture<?>> cmdFutures = new ConcurrentHashMap<>();
     private final Map<String, KVRangeDumpSession> dumpSessions = Maps.newConcurrentMap();
     private final AtomicInteger taskSeqNo = new AtomicInteger();
-    private final Subject<ClusterConfig> clusterConfigSubject = BehaviorSubject.<ClusterConfig>create().toSerialized();
-    private final Subject<KVRangeDescriptor> descriptorSubject = BehaviorSubject.create();
+    private final BehaviorSubject<KVRangeDescriptor> descriptorSubject = BehaviorSubject.create();
     private final Subject<List<SplitHint>> splitHintsSubject = BehaviorSubject.<List<SplitHint>>create().toSerialized();
     private final Subject<Any> factSubject = BehaviorSubject.create();
     private final KVRangeOptions opts;
+    private final AtomicBoolean recovering = new AtomicBoolean();
     private final AtomicReference<Lifecycle> lifecycle = new AtomicReference<>(Lifecycle.Init);
     private final CompositeDisposable disposables = new CompositeDisposable();
     private final CompletableFuture<Void> closeSignal = new CompletableFuture<>();
     private final CompletableFuture<Void> quitSignal = new CompletableFuture<>();
     private final CompletableFuture<Void> destroyedSignal = new CompletableFuture<>();
+    private final AtomicLong lastShrinkCheckAt = new AtomicLong();
+    private final AtomicBoolean shrinkingWAL = new AtomicBoolean();
     private final KVRangeMetricManager metricManager;
     private final List<IKVRangeSplitHinter> splitHinters;
     private final StampedLock resetLock = new StampedLock();
@@ -206,7 +215,7 @@ public class KVRangeFSM implements IKVRangeFSM {
         long lastAppliedIndex = this.kvRange.lastAppliedIndex();
         this.linearizer = new KVRangeQueryLinearizer(wal::readIndex, queryExecutor, lastAppliedIndex, tags);
         this.queryRunner = new KVRangeQueryRunner(this.kvRange, coProc, queryExecutor, linearizer,
-            splitHinters, resetLock, tags);
+            splitHinters, this::latestLeaderDescriptor, resetLock, tags);
         this.statsCollector = new KVRangeStatsCollector(this.kvRange,
             wal, Duration.ofSeconds(opts.getStatsCollectIntervalSec()), bgExecutor);
         this.metricManager = new KVRangeMetricManager(clusterId, hostStoreId, id);
@@ -242,11 +251,11 @@ public class KVRangeFSM implements IKVRangeFSM {
     }
 
     @Override
-    public void open(IKVRangeMessenger messenger) {
+    public CompletableFuture<Void> open(IKVRangeMessenger messenger) {
         if (lifecycle.get() != Init) {
-            return;
+            return CompletableFuture.completedFuture(null);
         }
-        mgmtTaskRunner.add(() -> {
+        return mgmtTaskRunner.add(() -> {
             if (lifecycle.compareAndSet(Init, Lifecycle.Opening)) {
                 this.messenger = messenger;
                 factSubject.onNext(reset(kvRange.boundary()));
@@ -266,21 +275,17 @@ public class KVRangeFSM implements IKVRangeFSM {
                                 .build());
                         }
                     }));
-                disposables.add(wal.snapshotRestoreEvent()
-                    .subscribe(e -> clusterConfigSubject.onNext(e.snapshot.getClusterConfig())));
                 disposables.add(descriptorSubject.subscribe(metricManager::report));
                 disposables.add(Observable.combineLatest(
                         kvRange.metadata().distinctUntilChanged(),
                         wal.state().distinctUntilChanged(),
                         wal.replicationStatus().distinctUntilChanged(),
-                        clusterConfigSubject.distinctUntilChanged(),
                         statsCollector.collect().distinctUntilChanged(),
                         splitHintsSubject.distinctUntilChanged(),
                         factSubject.distinctUntilChanged(),
                         (meta,
                          role,
                          syncStats,
-                         clusterConfig,
                          rangeStats,
                          splitHints,
                          fact) -> {
@@ -291,7 +296,7 @@ public class KVRangeFSM implements IKVRangeFSM {
                                 .setBoundary(meta.boundary())
                                 .setRole(role)
                                 .setState(meta.state().getType())
-                                .setConfig(clusterConfig)
+                                .setConfig(meta.clusterConfig())
                                 .putAllSyncState(syncStats)
                                 .putAllStatistics(rangeStats)
                                 .addAllHints(splitHints)
@@ -303,15 +308,14 @@ public class KVRangeFSM implements IKVRangeFSM {
                     .subscribe(descriptorSubject::onNext));
                 disposables.add(messenger.receive().subscribe(this::handleMessage));
                 disposables.add(descriptorSubject.subscribe(this::detectZombieState));
-                clusterConfigSubject.onNext(wal.clusterConfig());
                 lifecycle.set(Open);
                 metricManager.reportLastAppliedIndex(kvRange.lastAppliedIndex());
                 log.info("Open range: appliedIndex={}, state={}, ver={}",
-                    kvRange.lastAppliedIndex(), kvRange.state().getType(), kvRange.version());
+                    kvRange.lastAppliedIndex(), kvRange.state().getType(), print(kvRange.version()));
                 // make sure latest snapshot exists
                 if (!kvRange.hasCheckpoint(wal.latestSnapshot())) {
                     log.debug("Latest snapshot not available, do compaction: \n{}", wal.latestSnapshot());
-                    compactWAL(false);
+                    compactWAL();
                 }
             }
         });
@@ -325,7 +329,7 @@ public class KVRangeFSM implements IKVRangeFSM {
         wal.tick();
         statsCollector.tick();
         dumpSessions.values().forEach(KVRangeDumpSession::tick);
-        compactWAL(true);
+        shrinkWAL();
         checkZombieState();
         estimateSplitHint();
     }
@@ -346,15 +350,11 @@ public class KVRangeFSM implements IKVRangeFSM {
             case Open -> {
                 if (lifecycle.compareAndSet(Open, Lifecycle.Closing)) {
                     log.info("Closing range");
-                    clusterConfigSubject.onComplete();
                     descriptorSubject.onComplete();
                     disposables.dispose();
                     walSubscription.stop();
-                    queryRunner.close();
                     splitHinters.forEach(IKVRangeSplitHinter::close);
                     coProc.close();
-                    cmdFutures.values()
-                        .forEach(f -> f.completeExceptionally(new KVRangeException.TryLater("Range closed")));
                     CompletableFuture.allOf(dumpSessions.values()
                             .stream()
                             .map(dumpSession -> {
@@ -364,6 +364,7 @@ public class KVRangeFSM implements IKVRangeFSM {
                             .toArray(CompletableFuture<?>[]::new))
                         .thenCompose(v -> restorer.awaitDone())
                         .thenCompose(v -> statsCollector.stop())
+                        .thenCompose(v -> mgmtTaskRunner.awaitDone())
                         .thenCompose(v -> wal.close())
                         .thenCompose(v -> {
                             kvRange.close();
@@ -371,6 +372,9 @@ public class KVRangeFSM implements IKVRangeFSM {
                             return awaitShutdown(fsmExecutor);
                         })
                         .whenComplete((v, e) -> {
+                            cmdFutures.values()
+                                .forEach(f -> f.completeExceptionally(new KVRangeException.TryLater("Range closed")));
+                            queryRunner.close();
                             log.info("Range closed");
                             lifecycle.set(Closed);
                             closeSignal.complete(null);
@@ -414,24 +418,39 @@ public class KVRangeFSM implements IKVRangeFSM {
 
     @Override
     public CompletableFuture<Void> transferLeadership(long ver, String newLeader) {
-        return metricManager.recordTransferLeader(() -> submitCommand(KVRangeCommand.newBuilder()
-            .setTaskId(nextTaskId())
-            .setVer(ver)
-            .setTransferLeadership(TransferLeadership.newBuilder()
-                .setNewLeader(newLeader)
-                .build())
-            .build()));
+        return metricManager.recordTransferLeader(() -> {
+            if (ver != kvRange.version()) {
+                // version not exactly match
+                return CompletableFuture.failedFuture(
+                    new KVRangeException.BadVersion("Version Mismatch", latestLeaderDescriptor()));
+            }
+            log.info("Transferring leader[ver={}, state={}]: newLeader={}",
+                print(ver), kvRange.state().getType(), newLeader);
+            return wal.transferLeadership(newLeader)
+                .exceptionally(unwrap(e -> {
+                    if (e instanceof LeaderTransferException.NotFoundOrQualifiedException) {
+                        throw new KVRangeException.BadRequest("Failed to transfer leadership", e);
+                    } else {
+                        throw new KVRangeException.TryLater("Failed to transfer leadership", e);
+                    }
+                }));
+        });
     }
 
     @Override
     public CompletableFuture<Void> changeReplicaConfig(long ver, Set<String> newVoters, Set<String> newLearners) {
+        if (isNotOpening()) {
+            // treat un-opened range as not exist
+            return CompletableFuture.failedFuture(
+                new KVRangeException.InternalException("Range not open:" + KVRangeIdUtil.toString(id)));
+        }
         return changeReplicaConfig(nextTaskId(), ver, newVoters, newLearners);
     }
 
     private CompletableFuture<Void> changeReplicaConfig(String taskId, long ver,
                                                         Set<String> newVoters,
                                                         Set<String> newLearners) {
-        return metricManager.recordConfigChange(() -> submitCommand(KVRangeCommand.newBuilder()
+        return metricManager.recordConfigChange(() -> submitManagementCommand(KVRangeCommand.newBuilder()
             .setTaskId(taskId)
             .setVer(ver)
             .setChangeConfig(ChangeConfig.newBuilder()
@@ -443,7 +462,7 @@ public class KVRangeFSM implements IKVRangeFSM {
 
     @Override
     public CompletableFuture<Void> split(long ver, ByteString splitKey) {
-        return metricManager.recordSplit(() -> submitCommand(KVRangeCommand.newBuilder()
+        return metricManager.recordSplit(() -> submitManagementCommand(KVRangeCommand.newBuilder()
             .setTaskId(nextTaskId())
             .setVer(ver)
             .setSplitRange(SplitRange.newBuilder()
@@ -455,7 +474,7 @@ public class KVRangeFSM implements IKVRangeFSM {
 
     @Override
     public CompletableFuture<Void> merge(long ver, KVRangeId mergeeId) {
-        return metricManager.recordMerge(() -> submitCommand(KVRangeCommand.newBuilder()
+        return metricManager.recordMerge(() -> submitManagementCommand(KVRangeCommand.newBuilder()
             .setTaskId(nextTaskId())
             .setVer(ver)
             .setPrepareMergeWith(PrepareMergeWith.newBuilder()
@@ -496,7 +515,7 @@ public class KVRangeFSM implements IKVRangeFSM {
 
     @Override
     public CompletableFuture<ByteString> put(long ver, ByteString key, ByteString value) {
-        return metricManager.recordPut(() -> submitCommand(KVRangeCommand.newBuilder()
+        return metricManager.recordPut(() -> submitMutationCommand(KVRangeCommand.newBuilder()
             .setVer(ver)
             .setTaskId(nextTaskId())
             .setPut(Put.newBuilder().setKey(key).setValue(value).build())
@@ -505,7 +524,7 @@ public class KVRangeFSM implements IKVRangeFSM {
 
     @Override
     public CompletableFuture<ByteString> delete(long ver, ByteString key) {
-        return metricManager.recordDelete(() -> submitCommand(KVRangeCommand.newBuilder()
+        return metricManager.recordDelete(() -> submitMutationCommand(KVRangeCommand.newBuilder()
             .setVer(ver)
             .setTaskId(nextTaskId())
             .setDelete(Delete.newBuilder().setKey(key).build())
@@ -514,11 +533,46 @@ public class KVRangeFSM implements IKVRangeFSM {
 
     @Override
     public CompletableFuture<RWCoProcOutput> mutateCoProc(long ver, RWCoProcInput mutate) {
-        return metricManager.recordMutateCoProc(() -> submitCommand(KVRangeCommand.newBuilder()
+        return metricManager.recordMutateCoProc(() -> submitMutationCommand(KVRangeCommand.newBuilder()
             .setVer(ver)
             .setTaskId(nextTaskId())
             .setRwCoProc(mutate)
             .build()));
+    }
+
+    private <T> CompletableFuture<T> submitMutationCommand(KVRangeCommand mutationCommand) {
+        if (isNotOpening()) {
+            // treat un-opened range as not exist
+            return CompletableFuture.failedFuture(
+                new KVRangeException.InternalException("Range not open:" + KVRangeIdUtil.toString(id)));
+        }
+        if (!boundaryCompatible(mutationCommand.getVer(), kvRange.version())) {
+            return CompletableFuture.failedFuture(
+                new KVRangeException.BadVersion("Version Mismatch", latestLeaderDescriptor()));
+        }
+        State state = kvRange.state();
+        if (state.getType() == NoUse
+            || state.getType() == WaitingForMerge
+            || state.getType() == Merged
+            || state.getType() == MergedQuiting
+            || state.getType() == Removed
+            || state.getType() == ToBePurged) {
+            return CompletableFuture.failedFuture(new KVRangeException.TryLater(
+                "Range is being merge or has been merged: state=" + state.getType().name()));
+        }
+        return submitCommand(mutationCommand);
+    }
+
+    private <T> CompletableFuture<T> submitManagementCommand(KVRangeCommand managementCommand) {
+        if (isNotOpening()) {
+            return CompletableFuture.failedFuture(
+                new KVRangeException.InternalException("Range not open:" + KVRangeIdUtil.toString(id)));
+        }
+        if (managementCommand.getVer() != kvRange.version()) {
+            return CompletableFuture.failedFuture(
+                new KVRangeException.BadVersion("Version Mismatch", latestLeaderDescriptor()));
+        }
+        return submitCommand(managementCommand);
     }
 
     @Override
@@ -532,10 +586,6 @@ public class KVRangeFSM implements IKVRangeFSM {
 
     @SuppressWarnings("unchecked")
     private <T> CompletableFuture<T> submitCommand(KVRangeCommand command) {
-        if (isNotOpening()) {
-            return CompletableFuture.failedFuture(
-                new KVRangeException.InternalException("Range not open:" + KVRangeIdUtil.toString(id)));
-        }
         CompletableFuture<T> onDone = new CompletableFuture<>();
 
         // add to writeRequests must happen before proposing
@@ -624,8 +674,9 @@ public class KVRangeFSM implements IKVRangeFSM {
                     long version = kvRange.version();
                     State state = kvRange.state();
                     Boundary boundary = kvRange.boundary();
-                    applyCommand(version, state, boundary, entry.getTerm(), entry.getIndex(), command, recordableReader,
-                        rangeWriter)
+                    ClusterConfig clusterConfig = kvRange.clusterConfig();
+                    applyCommand(version, state, boundary, clusterConfig,
+                        entry.getTerm(), entry.getIndex(), command, recordableReader, rangeWriter)
                         .whenComplete((callback, e) -> {
                             if (onDone.isCancelled()) {
                                 rangeWriter.abort();
@@ -659,6 +710,9 @@ public class KVRangeFSM implements IKVRangeFSM {
                     onDone.completeExceptionally(t);
                 }
             }
+            default -> {
+                // no nothing
+            }
         }
         return onDone;
     }
@@ -670,9 +724,10 @@ public class KVRangeFSM implements IKVRangeFSM {
         State state = rangeWriter.state();
         log.info("Apply new config[term={}, index={}]: state={}, leader={}\n{}",
             term, index, state, wal.isLeader(), config);
+        rangeWriter.clusterConfig(config);
         if (config.getNextVotersCount() != 0 || config.getNextLearnersCount() != 0) {
             // skip joint-config
-            onDone.complete(() -> clusterConfigSubject.onNext(config));
+            onDone.complete(NOOP);
             return onDone;
         }
         Set<String> members = newHashSet();
@@ -693,7 +748,6 @@ public class KVRangeFSM implements IKVRangeFSM {
                             .setTaskId(taskId)
                             .build());
                         onDone.complete(() -> {
-                            clusterConfigSubject.onNext(config);
                             quitSignal.complete(null);
                             finishCommand(taskId);
                         });
@@ -703,7 +757,6 @@ public class KVRangeFSM implements IKVRangeFSM {
                             .setTaskId(taskId)
                             .build());
                         onDone.complete(() -> {
-                            clusterConfigSubject.onNext(config);
                             finishCommand(taskId);
                         });
                     }
@@ -716,7 +769,6 @@ public class KVRangeFSM implements IKVRangeFSM {
                             .setTaskId(taskId)
                             .build());
                         onDone.complete(() -> {
-                            clusterConfigSubject.onNext(config);
                             quitSignal.complete(null);
                             finishCommand(taskId);
                         });
@@ -725,10 +777,7 @@ public class KVRangeFSM implements IKVRangeFSM {
                             .setType(Normal)
                             .setTaskId(taskId)
                             .build());
-                        onDone.complete(() -> {
-                            clusterConfigSubject.onNext(config);
-                            finishCommand(taskId);
-                        });
+                        onDone.complete(() -> finishCommand(taskId));
                     }
                 }
             }
@@ -748,7 +797,6 @@ public class KVRangeFSM implements IKVRangeFSM {
                 }
                 rangeWriter.bumpVer(false);
                 onDone.complete(() -> {
-                    clusterConfigSubject.onNext(config);
                     finishCommand(taskId);
                     if (remove) {
                         quitSignal.complete(null);
@@ -773,14 +821,13 @@ public class KVRangeFSM implements IKVRangeFSM {
                         .setTaskId(taskId)
                         .build());
                     onDone.complete(() -> {
-                        clusterConfigSubject.onNext(config);
                         finishCommand(taskId);
                     });
                 }
             }
             default ->
                 // skip internal config change triggered by leadership change
-                onDone.complete(() -> clusterConfigSubject.onNext(config));
+                onDone.complete(NOOP);
         }
         return onDone;
     }
@@ -788,6 +835,7 @@ public class KVRangeFSM implements IKVRangeFSM {
     private CompletableFuture<Runnable> applyCommand(long ver,
                                                      State state,
                                                      Boundary boundary,
+                                                     ClusterConfig clusterConfig,
                                                      long logTerm,
                                                      long logIndex,
                                                      KVRangeCommand command,
@@ -796,16 +844,18 @@ public class KVRangeFSM implements IKVRangeFSM {
         CompletableFuture<Runnable> onDone = new CompletableFuture<>();
         long reqVer = command.getVer();
         String taskId = command.getTaskId();
-        log.trace("Execute KVRange Command[term={}, index={}, taskId={}]: ver={}, state={}, \n{}",
-            logTerm, logIndex, taskId, ver, state, command);
+        if (log.isTraceEnabled()) {
+            log.trace("Execute KVRange Command[term={}, index={}, taskId={}]: ver={}, state={}, \n{}",
+                logTerm, logIndex, taskId, print(ver), state, command);
+        }
         switch (command.getCommandTypeCase()) {
             // admin commands
             case CHANGECONFIG -> {
                 ChangeConfig newConfig = command.getChangeConfig();
                 if (reqVer != ver) {
                     // version not match, hint the caller
-                    onDone.complete(
-                        () -> finishCommandWithError(taskId, new KVRangeException.BadVersion("Version Mismatch")));
+                    onDone.complete(() -> finishCommandWithError(taskId,
+                        new KVRangeException.BadVersion("Version Mismatch", latestLeaderDescriptor())));
                     break;
                 }
                 if (state.getType() != Normal && state.getType() != Merged) {
@@ -815,7 +865,8 @@ public class KVRangeFSM implements IKVRangeFSM {
                 }
                 log.info(
                     "Changing Config[term={}, index={}, taskId={}, ver={}, state={}]: nextVoters={}, nextLearners={}",
-                    logTerm, logIndex, taskId, ver, state, newConfig.getVotersList(), newConfig.getLearnersList());
+                    logTerm, logIndex, taskId, print(ver), state, newConfig.getVotersList(),
+                    newConfig.getLearnersList());
                 // make a checkpoint if needed
                 CompletableFuture<Void> compactWALFuture = CompletableFuture.completedFuture(null);
                 if (wal.latestSnapshot().getLastAppliedIndex() < logIndex - 1) {
@@ -824,28 +875,28 @@ public class KVRangeFSM implements IKVRangeFSM {
                         session.cancel();
                         dumpSessions.remove(sessionId, session);
                     });
-                    compactWALFuture = compactWAL(false);
+                    compactWALFuture = compactWAL();
                 }
                 compactWALFuture.whenCompleteAsync((v, e) -> {
                     if (e != null) {
                         log.error(
                             "WAL compact failed during ConfigChange[term={}, index={}, taskId={}]: ver={}, state={}",
-                            logTerm, logIndex, taskId, ver, state);
+                            logTerm, logIndex, taskId, print(ver), state);
                         // abort log apply and retry
                         onDone.completeExceptionally(e);
                     } else {
-                        ClusterConfig curConfig = wal.clusterConfig();
-                        boolean toBePurged = isGracefulQuit(curConfig, newConfig);
+                        boolean toBePurged = isGracefulQuit(clusterConfig, newConfig);
                         // notify new voters and learners host store to ensure the range exist
                         Set<String> newHostingStoreIds = difference(
                             difference(
                                 union(newHashSet(newConfig.getVotersList()), newHashSet(newConfig.getLearnersList())),
-                                union(newHashSet(curConfig.getVotersList()), newHashSet(curConfig.getLearnersList()))
+                                union(newHashSet(clusterConfig.getVotersList()),
+                                    newHashSet(clusterConfig.getLearnersList()))
                             ),
                             singleton(hostStoreId)
                         );
                         Set<String> nextVoters = toBePurged
-                            ? newHashSet(curConfig.getVotersList()) : newHashSet(newConfig.getVotersList());
+                            ? newHashSet(clusterConfig.getVotersList()) : newHashSet(newConfig.getVotersList());
                         Set<String> nextLearners = toBePurged
                             ? emptySet() : newHashSet(newConfig.getLearnersList());
                         List<CompletableFuture<?>> onceFutures = newHostingStoreIds.stream()
@@ -885,6 +936,7 @@ public class KVRangeFSM implements IKVRangeFSM {
                             }, fsmExecutor);
                         newHostingStoreIds.forEach(storeId -> {
                             log.debug("Send EnsureRequest: taskId={}, targetStoreId={}", taskId, storeId);
+                            ClusterConfig ensuredClusterConfig = ClusterConfig.getDefaultInstance();
                             messenger.send(KVRangeMessage.newBuilder()
                                 .setRangeId(id)
                                 .setHostStoreId(storeId)
@@ -894,7 +946,7 @@ public class KVRangeFSM implements IKVRangeFSM {
                                     .setInitSnapshot(Snapshot.newBuilder()
                                         .setTerm(0)
                                         .setIndex(0)
-                                        .setClusterConfig(ClusterConfig.getDefaultInstance()) // empty voter set
+                                        .setClusterConfig(ensuredClusterConfig) // empty voter set
                                         .setData(KVRangeSnapshot.newBuilder()
                                             .setVer(ver)
                                             .setId(id)
@@ -902,6 +954,7 @@ public class KVRangeFSM implements IKVRangeFSM {
                                             .setLastAppliedIndex(0)
                                             .setBoundary(boundary)
                                             .setState(state)
+                                            .setClusterConfig(ensuredClusterConfig)
                                             .build().toByteString())
                                         .build())
                                     .build())
@@ -938,47 +991,12 @@ public class KVRangeFSM implements IKVRangeFSM {
                     }
                 }, fsmExecutor);
             }
-            case TRANSFERLEADERSHIP -> {
-                TransferLeadership request = command.getTransferLeadership();
-                if (reqVer != ver) {
-                    // version not match, hint the caller
-                    onDone.complete(() -> finishCommandWithError(taskId,
-                        new KVRangeException.BadVersion("Version Mismatch")));
-                    break;
-                }
-                if (state.getType() != Normal) {
-                    onDone.complete(() -> finishCommandWithError(taskId,
-                        new KVRangeException.TryLater(
-                            "Transfer leader abort, range is in state:" + state.getType().name())));
-                    break;
-                }
-                log.info("Transferring leader[term={}, index={}, taskId={}, ver={}, state={}]: newLeader={}",
-                    logTerm, logIndex, taskId, ver, state, request.getNewLeader());
-                wal.transferLeadership(request.getNewLeader())
-                    .whenCompleteAsync((v, e) -> {
-                        if (e != null) {
-                            log.debug("Failed to transfer leadership[newLeader={}] due to {}",
-                                request.getNewLeader(), e.getMessage());
-                            if (e instanceof LeaderTransferException.NotFoundOrQualifiedException
-                                || e.getCause() instanceof LeaderTransferException.NotFoundOrQualifiedException) {
-                                finishCommandWithError(taskId, new KVRangeException.BadRequest(
-                                    "Failed to transfer leadership", e));
-                            } else {
-                                finishCommandWithError(taskId, new KVRangeException.TryLater(
-                                    "Failed to transfer leadership", e));
-                            }
-                        } else {
-                            finishCommand(taskId);
-                        }
-                    }, fsmExecutor);
-                onDone.complete(NOOP);
-            }
             case SPLITRANGE -> {
                 SplitRange request = command.getSplitRange();
                 if (reqVer != ver) {
                     // version not match, hint the caller
-                    onDone.complete(
-                        () -> finishCommandWithError(taskId, new KVRangeException.BadVersion("Version Mismatch")));
+                    onDone.complete(() -> finishCommandWithError(taskId,
+                        new KVRangeException.BadVersion("Version Mismatch", latestLeaderDescriptor())));
                     break;
                 }
                 if (state.getType() != Normal) {
@@ -991,17 +1009,18 @@ public class KVRangeFSM implements IKVRangeFSM {
                 if (isSplittable(boundary, request.getSplitKey())) {
                     log.info(
                         "Splitting range[term={}, index={}, taskId={}, ver={}, state={}]: newRangeId={}, splitKey={}",
-                        logTerm, logIndex, taskId, ver, state,
+                        logTerm, logIndex, taskId, print(ver), state,
                         KVRangeIdUtil.toString(request.getNewId()), request.getSplitKey().toStringUtf8());
                     Boundary[] boundaries = BoundaryUtil.split(boundary, request.getSplitKey());
                     Boundary leftBoundary = boundaries[0];
                     Boundary rightBoundary = boundaries[1];
                     KVRangeSnapshot rhsSS = KVRangeSnapshot.newBuilder()
-                        .setVer(ver + 1)
+                        .setVer(VerUtil.bump(ver, true))
                         .setId(request.getNewId())
                         // no checkpoint specified
                         .setLastAppliedIndex(5)
                         .setBoundary(rightBoundary)
+                        .setClusterConfig(clusterConfig)
                         .setState(State.newBuilder()
                             .setType(Normal)
                             .setTaskId(taskId)
@@ -1011,9 +1030,10 @@ public class KVRangeFSM implements IKVRangeFSM {
                     // migrate data to right-hand keyspace which created implicitly
                     rangeWriter.migrateTo(request.getNewId(), rightBoundary)
                         .resetVer(rhsSS.getVer())
-                        .boundary(rightBoundary)
+                        .boundary(rhsSS.getBoundary())
                         .lastAppliedIndex(rhsSS.getLastAppliedIndex())
                         .state(rhsSS.getState())
+                        .clusterConfig(rhsSS.getClusterConfig())
                         .done();
                     onDone.complete(() -> {
                         try {
@@ -1047,7 +1067,7 @@ public class KVRangeFSM implements IKVRangeFSM {
                                 .setInitSnapshot(Snapshot.newBuilder()
                                     .setTerm(0)
                                     .setIndex(rhsSS.getLastAppliedIndex())
-                                    .setClusterConfig(wal.clusterConfig())
+                                    .setClusterConfig(rhsSS.getClusterConfig())
                                     .setData(rhsSS.toByteString())
                                     .build())
                                 .build()).build());
@@ -1062,7 +1082,7 @@ public class KVRangeFSM implements IKVRangeFSM {
                 if (reqVer != ver) {
                     // version not match, hint the caller
                     onDone.complete(() -> finishCommandWithError(taskId,
-                        new KVRangeException.BadVersion("Version Mismatch")));
+                        new KVRangeException.BadVersion("Version Mismatch", latestLeaderDescriptor())));
                     break;
                 }
                 if (state.getType() != Normal) {
@@ -1072,7 +1092,7 @@ public class KVRangeFSM implements IKVRangeFSM {
                 }
                 log.info(
                     "Merging[term={}, index={}, taskId={}, ver={}, state={}]: mergerId={}, mergeeId={}",
-                    logTerm, logIndex, taskId, ver, state,
+                    logTerm, logIndex, taskId, print(ver), state,
                     KVRangeIdUtil.toString(id), KVRangeIdUtil.toString(command.getPrepareMergeWith().getMergeeId()));
 
                 CompletableFuture<KVRangeMessage> onceFuture = messenger.once(m -> m.hasPrepareMergeToReply()
@@ -1089,8 +1109,7 @@ public class KVRangeFSM implements IKVRangeFSM {
                             onceFuture.cancel(true);
                             onDone.completeExceptionally(e);
                         } else {
-                            ClusterConfig config = wal.clusterConfig();
-                            Map<String, Boolean> waitingList = config.getVotersList().stream()
+                            Map<String, Boolean> waitingList = clusterConfig.getVotersList().stream()
                                 .collect(Collectors.toMap(voter -> voter, voter -> false));
                             rangeWriter.state(State.newBuilder()
                                 .setType(PreparedMerging)
@@ -1111,7 +1130,7 @@ public class KVRangeFSM implements IKVRangeFSM {
                         .setId(id)
                         .setVer(VerUtil.bump(ver, false))
                         .setBoundary(boundary)
-                        .setConfig(wal.clusterConfig())
+                        .setConfig(clusterConfig)
                         .build())
                     .build());
             }
@@ -1122,16 +1141,19 @@ public class KVRangeFSM implements IKVRangeFSM {
                 }
                 log.info(
                     "Merge canceled[term={}, index={}, taskId={}, ver={}, state={}]: mergerId={}, mergeeId={}",
-                    logTerm, logIndex, taskId, ver, state,
+                    logTerm, logIndex, taskId, print(ver), state,
                     KVRangeIdUtil.toString(id), KVRangeIdUtil.toString(command.getPrepareMergeWith().getMergeeId()));
-                assert state.getType() == PreparedMerging && state.hasTaskId() && taskId.equals(state.getTaskId());
-                rangeWriter.state(State.newBuilder()
-                    .setType(Normal)
-                    .setTaskId(taskId)
-                    .build());
-                rangeWriter.bumpVer(false);
-                onDone.complete(
-                    () -> finishCommandWithError(taskId, new KVRangeException.TryLater("Merge canceled")));
+                if (state.getType() == PreparedMerging && state.hasTaskId() && taskId.equals(state.getTaskId())) {
+                    rangeWriter.state(State.newBuilder()
+                        .setType(Normal)
+                        .setTaskId(taskId)
+                        .build());
+                    rangeWriter.bumpVer(false);
+                    onDone.complete(
+                        () -> finishCommandWithError(taskId, new KVRangeException.TryLater("Merge canceled")));
+                } else {
+                    onDone.complete(NOOP);
+                }
             }
             case PREPAREMERGETO -> {
                 PrepareMergeTo request = command.getPrepareMergeTo();
@@ -1141,7 +1163,7 @@ public class KVRangeFSM implements IKVRangeFSM {
                 }
                 // here is the formal mergeable condition check
                 if (state.getType() != Normal
-                    || !isCompatible(request.getConfig(), wal.clusterConfig())
+                    || !isCompatible(request.getConfig(), clusterConfig)
                     || !canCombine(request.getBoundary(), boundary)) {
                     if (!taskId.equals(state.getTaskId())) {
                         log.debug("Cancel the loser merger[{}]",
@@ -1279,14 +1301,14 @@ public class KVRangeFSM implements IKVRangeFSM {
                         }
                     }, fsmExecutor);
                 }
-                readyToMerge.whenCompleteAsync((_v, _e) -> {
-                    if (_e != null) {
+                readyToMerge.whenCompleteAsync((v1, e1) -> {
+                    if (e1 != null) {
                         onDone.completeExceptionally(
                             new KVRangeException.TryLater("Merge condition not met"));
                         return;
                     }
                     // migrate data from mergee, and commit the migration after getting merge done reply
-                    long newVer = Math.max(ver, request.getMergeeVer()) + 2;
+                    long newVer = Math.max(ver, request.getMergeeVer());
                     // make sure the version is odd
                     Boundary mergedBoundary = combine(boundary, request.getBoundary());
                     IKVRangeMetadataWriter<?> rightRangeWriter = rangeWriter.resetVer(VerUtil.bump(newVer, true))
@@ -1315,7 +1337,8 @@ public class KVRangeFSM implements IKVRangeFSM {
                             } else {
                                 log.info(
                                     "Merger done[term={}, index={}, taskId={}, ver={}, state={}]: mergerId={}, boundary={}",
-                                    logTerm, logIndex, taskId, ver, state, KVRangeIdUtil.toString(id), mergedBoundary);
+                                    logTerm, logIndex, taskId, print(ver), state, KVRangeIdUtil.toString(id),
+                                    mergedBoundary);
                                 onDone.complete(() -> {
                                     try {
                                         // reset hinter when boundary changed
@@ -1351,7 +1374,7 @@ public class KVRangeFSM implements IKVRangeFSM {
                 }
                 log.info(
                     "Mergee done[term={}, index={}, taskId={}, ver={}, state={}]: mergeeId={}",
-                    logTerm, logIndex, taskId, ver, state, KVRangeIdUtil.toString(id));
+                    logTerm, logIndex, taskId, print(ver), state, KVRangeIdUtil.toString(id));
                 if (request.getStoreId().equals(hostStoreId)) {
                     assert state.getType() == WaitingForMerge
                         && state.hasTaskId()
@@ -1378,14 +1401,15 @@ public class KVRangeFSM implements IKVRangeFSM {
                 }
             }
             case PUT, DELETE, RWCOPROC -> {
-                if (reqVer != ver) {
-                    onDone.complete(
-                        () -> finishCommandWithError(taskId,
-                            new KVRangeException.BadVersion("Version Mismatch")));
+                if (!boundaryCompatible(reqVer, ver)) {
+                    onDone.complete(() -> finishCommandWithError(taskId,
+                        new KVRangeException.BadVersion("Version Mismatch", latestLeaderDescriptor())));
                     break;
                 }
-                if (state.getType() == WaitingForMerge
+                if (state.getType() == NoUse
+                    || state.getType() == WaitingForMerge
                     || state.getType() == Merged
+                    || state.getType() == MergedQuiting
                     || state.getType() == Removed
                     || state.getType() == ToBePurged) {
                     onDone.complete(() -> finishCommandWithError(taskId,
@@ -1419,6 +1443,9 @@ public class KVRangeFSM implements IKVRangeFSM {
                                 finishCommand(taskId, result.output());
                             });
                         }
+                        default -> {
+                            // do nothing
+                        }
                     }
                 } catch (Throwable e) {
                     onDone.complete(
@@ -1441,31 +1468,50 @@ public class KVRangeFSM implements IKVRangeFSM {
             && nextConfig.getLearnersCount() == 0;
     }
 
+    private KVRangeDescriptor latestLeaderDescriptor() {
+        if (wal.isLeader()) {
+            return descriptorSubject.getValue();
+        }
+        return null;
+    }
+
     private CompletableFuture<Void> restore(KVRangeSnapshot snapshot,
                                             String leader,
                                             IKVRangeWALSubscriber.IAfterRestoredCallback onInstalled) {
         if (isNotOpening()) {
-            onInstalled.call(null,
+            return onInstalled.call(null,
                 new KVRangeException.InternalException("Range not open:" + KVRangeIdUtil.toString(id)));
         }
-        return mgmtTaskRunner.add(() -> {
+        return mgmtTaskRunner.addFirst(() -> {
             if (isNotOpening()) {
                 return CompletableFuture.completedFuture(null);
             }
             return restorer.restoreFrom(leader, snapshot)
-                .exceptionallyCompose(e -> {
-                    log.debug("Restored from snapshot error: \n{}", snapshot, e);
-                    return onInstalled.call(null, e);
+                .handle((result, ex) -> {
+                    if (ex != null) {
+                        log.warn("Restored from snapshot error: \n{}", snapshot, ex);
+                        return onInstalled.call(null, ex);
+                    } else {
+                        return onInstalled.call(kvRange.checkpoint(), null);
+                    }
                 })
-                .thenAccept(v -> {
-                    linearizer.afterLogApplied(snapshot.getLastAppliedIndex());
-                    // reset the co-proc
-                    factSubject.onNext(reset(snapshot.getBoundary()));
-                    // finish all pending tasks
-                    cmdFutures.keySet().forEach(taskId -> finishCommandWithError(taskId,
-                        new KVRangeException.TryLater("Restored from snapshot, try again")));
-                })
-                .thenCompose(v -> onInstalled.call(kvRange.checkpoint(), null));
+                .thenCompose(f -> f)
+                .whenCompleteAsync(unwrap((v, e) -> {
+                    if (e != null) {
+                        if (e instanceof SnapshotException) {
+                            log.error("Failed to apply snapshot to WAL \n{}", snapshot, e);
+                            // WAL and FSM are inconsistent, need to quit and recreate again
+                            quitSignal.complete(null);
+                        }
+                    } else {
+                        linearizer.afterLogApplied(snapshot.getLastAppliedIndex());
+                        // reset the co-proc
+                        factSubject.onNext(reset(snapshot.getBoundary()));
+                        // finish all pending tasks
+                        cmdFutures.keySet().forEach(taskId -> finishCommandWithError(taskId,
+                            new KVRangeException.TryLater("Restored from snapshot, try again")));
+                    }
+                }), fsmExecutor);
         });
     }
 
@@ -1473,32 +1519,58 @@ public class KVRangeFSM implements IKVRangeFSM {
         splitHintsSubject.onNext(splitHinters.stream().map(IKVRangeSplitHinter::estimate).toList());
     }
 
-    private CompletableFuture<Void> compactWAL(boolean checkWALSize) {
-        return mgmtTaskRunner.add(() -> {
-            if (isNotOpening() || kvRange.state().getType() == ConfigChanging) {
-                // don't let compaction interferes with config changing process
-                return CompletableFuture.completedFuture(null);
+    private void shrinkWAL() {
+        if (isNotOpening()) {
+            return;
+        }
+        if (shrinkingWAL.compareAndSet(false, true)) {
+            long now = System.nanoTime();
+            if (now - lastShrinkCheckAt.get() < Duration.ofSeconds(opts.getShrinkWALCheckIntervalSec()).toNanos()) {
+                shrinkingWAL.set(false);
+                return;
             }
-            KVRangeSnapshot latestSnapshot = wal.latestSnapshot();
-            if (checkWALSize) {
-                long lastAppliedIndex = kvRange.lastAppliedIndex();
-                if (lastAppliedIndex - latestSnapshot.getLastAppliedIndex() < opts.getCompactWALThreshold()) {
+            lastShrinkCheckAt.set(now);
+            if (kvRange.lastAppliedIndex() - wal.latestSnapshot().getLastAppliedIndex()
+                < opts.getCompactWALThreshold()) {
+                shrinkingWAL.set(false);
+                return;
+            }
+            mgmtTaskRunner.add(() -> {
+                if (isNotOpening() || kvRange.state().getType() == ConfigChanging) {
+                    // don't let compaction interferes with config changing process
+                    shrinkingWAL.set(false);
                     return CompletableFuture.completedFuture(null);
                 }
-            }
-            if (!dumpSessions.isEmpty()) {
-                return CompletableFuture.completedFuture(null);
-            }
-            return metricManager.recordCompact(() -> {
-                KVRangeSnapshot snapshot = kvRange.checkpoint();
-                log.debug("Compact wal using snapshot:\n{}", snapshot);
-                return wal.compact(snapshot)
-                    .whenComplete((v, e) -> {
-                        if (e != null) {
-                            log.error("Failed to compact WAL due to {}: \n{}", e.getMessage(), snapshot);
-                        }
-                    });
+                KVRangeSnapshot latestSnapshot = wal.latestSnapshot();
+                long lastAppliedIndex = kvRange.lastAppliedIndex();
+                if (lastAppliedIndex - latestSnapshot.getLastAppliedIndex() < opts.getCompactWALThreshold()) {
+                    shrinkingWAL.set(false);
+                    return CompletableFuture.completedFuture(null);
+                }
+                if (!dumpSessions.isEmpty() || !restorer.awaitDone().isDone()) {
+                    shrinkingWAL.set(false);
+                    return CompletableFuture.completedFuture(null);
+                }
+                log.debug("Shrink wal with snapshot: lastAppliedIndex={}\n{}", lastAppliedIndex, latestSnapshot);
+                return doCompactWAL().whenComplete((v, e) -> shrinkingWAL.set(false));
             });
+        }
+    }
+
+    private CompletableFuture<Void> compactWAL() {
+        return mgmtTaskRunner.add(this::doCompactWAL);
+    }
+
+    private CompletableFuture<Void> doCompactWAL() {
+        return metricManager.recordCompact(() -> {
+            KVRangeSnapshot snapshot = kvRange.checkpoint();
+            log.debug("Compact wal using snapshot:\n{}", snapshot);
+            return wal.compact(snapshot)
+                .whenComplete((v, e) -> {
+                    if (e != null) {
+                        log.error("Failed to compact WAL due to {}: \n{}", e.getMessage(), snapshot);
+                    }
+                });
         });
     }
 
@@ -1517,8 +1589,19 @@ public class KVRangeFSM implements IKVRangeFSM {
     private void checkZombieState() {
         if (zombieAt > 0
             && Duration.ofMillis(HLC.INST.getPhysical() - zombieAt).toSeconds() > opts.getZombieTimeoutSec()) {
-            log.info("Zombie state detected, send quit signal.");
-            quitSignal.complete(null);
+            ClusterConfig clusterConfig = wal.latestClusterConfig();
+            if (clusterConfig.getNextVotersCount() > 0
+                && clusterConfig.getVotersList().equals(singletonList(hostStoreId))) {
+                // recover from single voter change lost quorum
+                if (recovering.compareAndSet(false, true)) {
+                    log.info("Recovering from lost quorum during changing config from single voter: \n{}",
+                        clusterConfig);
+                    wal.recover().whenComplete((v, e) -> recovering.set(false));
+                }
+            } else {
+                log.info("Zombie state detected, send quit signal.");
+                quitSignal.complete(null);
+            }
         }
     }
 
@@ -1553,6 +1636,9 @@ public class KVRangeFSM implements IKVRangeFSM {
             case CANCELMERGINGREQUEST ->
                 handleCancelMergingRequest(message.getHostStoreId(), message.getCancelMergingRequest());
             case MERGEDONEREQUEST -> handleMergeDoneRequest(message.getHostStoreId(), message.getMergeDoneRequest());
+            default -> {
+                // do nothing
+            }
         }
     }
 
@@ -1563,17 +1649,25 @@ public class KVRangeFSM implements IKVRangeFSM {
     private void handleSnapshotSyncRequest(String follower, SnapshotSyncRequest request) {
         log.info("Dumping snapshot: session={}: follower={}\n{}",
             request.getSessionId(), follower, request.getSnapshot());
-        KVRangeDumpSession session = new KVRangeDumpSession(follower, request, kvRange, messenger, fsmExecutor,
+        KVRangeDumpSession session = new KVRangeDumpSession(follower, request, kvRange, messenger,
             Duration.ofSeconds(opts.getSnapshotSyncIdleTimeoutSec()),
             opts.getSnapshotSyncBytesPerSec(), metricManager::reportDump, tags);
         dumpSessions.put(session.id(), session);
         session.awaitDone().whenComplete((result, e) -> {
-            log.info("Snapshot dumped: session={}, follower={}", session.id(), follower);
-            dumpSessions.remove(session.id(), session);
-            if (result == KVRangeDumpSession.Result.NoCheckpoint) {
-                log.info("No checkpoint found, compact WAL now");
-                compactWAL(false);
+            switch (result) {
+                case OK -> log.info("Snapshot dumped: session={}, follower={}", session.id(), follower);
+                case Canceled -> log.info("Snapshot dump canceled: session={}, follower={}", session.id(), follower);
+                case NoCheckpoint -> {
+                    log.info("No checkpoint found, compact WAL now");
+                    compactWAL();
+                }
+                case Abort -> log.info("Snapshot dump aborted: session={}, follower={}", session.id(), follower);
+                case Error -> log.warn("Snapshot dump failed: session={}, follower={}", session.id(), follower);
+                default -> {
+                    // do nothing
+                }
             }
+            dumpSessions.remove(session.id(), session);
         });
     }
 

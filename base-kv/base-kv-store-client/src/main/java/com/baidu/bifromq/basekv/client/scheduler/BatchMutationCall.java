@@ -13,7 +13,8 @@
 
 package com.baidu.bifromq.basekv.client.scheduler;
 
-import com.baidu.bifromq.basekv.client.IBaseKVStoreClient;
+import static com.baidu.bifromq.base.util.CompletableFutureUtil.unwrap;
+
 import com.baidu.bifromq.basekv.client.IMutationPipeline;
 import com.baidu.bifromq.basekv.client.exception.BadRequestException;
 import com.baidu.bifromq.basekv.client.exception.BadVersionException;
@@ -38,9 +39,9 @@ public abstract class BatchMutationCall<ReqT, RespT> implements IBatchCall<ReqT,
     private final IMutationPipeline storePipeline;
     private final Deque<MutationCallTaskBatch<ReqT, RespT>> batchCallTasks = new ArrayDeque<>();
 
-    protected BatchMutationCall(IBaseKVStoreClient storeClient, MutationCallBatcherKey batcherKey) {
+    protected BatchMutationCall(IMutationPipeline storePipeline, MutationCallBatcherKey batcherKey) {
         this.batcherKey = batcherKey;
-        this.storePipeline = storeClient.createMutationPipeline(batcherKey.leaderStoreId);
+        this.storePipeline = storePipeline;
     }
 
     @Override
@@ -82,11 +83,6 @@ public abstract class BatchMutationCall<ReqT, RespT> implements IBatchCall<ReqT,
         return fireBatchCall(1);
     }
 
-    @Override
-    public void destroy() {
-        storePipeline.close();
-    }
-
     private CompletableFuture<Void> fireBatchCall(int recursionDepth) {
         MutationCallTaskBatch<ReqT, RespT> batchCallTask = batchCallTasks.poll();
         if (batchCallTask == null) {
@@ -117,7 +113,7 @@ public abstract class BatchMutationCall<ReqT, RespT> implements IBatchCall<ReqT,
                     default -> throw new InternalErrorException();
                 }
             })
-            .handle((v, e) -> {
+            .handle(unwrap((v, e) -> {
                 if (e != null) {
                     ICallTask<ReqT, RespT, MutationCallBatcherKey> callTask;
                     while ((callTask = batchCallTask.batchedTasks.poll()) != null) {
@@ -127,7 +123,7 @@ public abstract class BatchMutationCall<ReqT, RespT> implements IBatchCall<ReqT,
                     handleOutput(batchCallTask.batchedTasks, v);
                 }
                 return null;
-            })
+            }))
             .thenCompose(v -> {
                 if (recursionDepth < MAX_RECURSION_DEPTH) {
                     return fireBatchCall(recursionDepth + 1);

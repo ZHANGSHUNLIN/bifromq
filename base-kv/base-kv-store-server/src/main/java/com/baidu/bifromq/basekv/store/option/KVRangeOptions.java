@@ -36,19 +36,22 @@ public class KVRangeOptions {
     @Builder.Default
     private int compactWALThreshold = 10000; // the max number of logs before compaction
     @Builder.Default
+    private int shrinkWALCheckIntervalSec = 60;
+    @Builder.Default
     private long tickUnitInMS = 100;
     @Builder.Default
     private int maxWALFatchBatchSize = 5 * 1024 * 1024; // 5MB
     @Builder.Default
-    private int snapshotSyncIdleTimeoutSec = 30;
+    private int snapshotSyncIdleTimeoutSec = 600; // 10min
     @Builder.Default
     private int statsCollectIntervalSec = 5;
     @Builder.Default
-    private int zombieTimeoutSec = 300; // 5min
+    private int zombieTimeoutSec = 60; // 1min
     @Builder.Default
     private RaftConfig walRaftConfig = new RaftConfig()
         .setPreVote(true)
-        .setInstallSnapshotTimeoutTick(300)
-        .setElectionTimeoutTick(30)
-        .setMaxSizePerAppend(10 * 1024 * 1024); // 10MB;
+        .setHeartbeatTimeoutTick(5) // 500ms
+        .setInstallSnapshotTimeoutTick(6000) // 10min
+        .setElectionTimeoutTick(30) // 3s
+        .setMaxSizePerAppend(100 * 1024 * 1024); // 100MB;
 }
