@@ -1,4 +1,4 @@
-name: Tests-optimized
+name: integration-test
 
 on:
   workflow_dispatch:
@@ -15,7 +15,7 @@ on:
       - 'fix-**'
 jobs:
   prepare:
-    name: "Integration Tests"
+    name: "integration-test"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
