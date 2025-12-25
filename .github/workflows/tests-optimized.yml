@@ -15,7 +15,7 @@ on:
       - 'fix-**'
 jobs:
   prepare:
-    name: "Prepare"
+    name: "Integration Tests"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,5 +26,5 @@ jobs:
           distribution: 'temurin'
           cache: maven
       - name: tests
-        run: mvn  test
+        run: mvn verify -Pintegration-test
 
