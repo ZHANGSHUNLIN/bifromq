@@ -1,4 +1,4 @@
-name: Build and Test BifroMQ
+name: Tests-optimized
 
 on:
   workflow_dispatch:
